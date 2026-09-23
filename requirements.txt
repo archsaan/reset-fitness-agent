@@ -1,0 +1,10 @@
+google-adk[extensions]==2.9.2
+fastapi
+uvicorn
+httpx
+psycopg[binary,pool]
+pgvector
+voyageai
+python-dotenv
+python-multipart
+sqlalchemy
