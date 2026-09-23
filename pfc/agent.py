@@ -7,11 +7,10 @@ tribe-app's).
 """
 
 from google.adk.agents import Agent
-from google.adk.models.lite_llm import LiteLlm
 
 from common.booking_gate import make_intercept_book_class, make_log_usage, make_resolve_pending_booking
 from common.booking_tools import book_class
-from common.config import PFC_MODEL, PFC_SYSTEM_PROMPT, RULES
+from common.config import PFC_MODEL, PFC_SYSTEM_PROMPT, RULES, resolve_model
 from common.schedule_tools import check_availability, get_schedule
 
 AGENT_SLUG = "pfc"
@@ -24,7 +23,7 @@ INSTRUCTION = (
 
 root_agent = Agent(
     name="reset_fitness_pfc",
-    model=LiteLlm(model=PFC_MODEL),
+    model=resolve_model(PFC_MODEL),
     instruction=INSTRUCTION,
     description="Helps Reset Fitness studio staff with schedule lookups and CRM tasks.",
     tools=[get_schedule, check_availability, book_class],

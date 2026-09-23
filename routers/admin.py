@@ -186,14 +186,22 @@ def _summarize_usage(rows) -> list[dict]:
         "claude-sonnet-4-5": {"input": 3.0, "output": 15.0},
         "grok-4": {"input": 3.0, "output": 15.0},
         "grok-3-mini": {"input": 0.3, "output": 0.5},
+        # Gemini via AI Studio's free tier is $0 — these are the PAID-tier
+        # rates only, so estimated_cost_usd will overstate cost while
+        # you're on the free key. Update once you're on a paid Gemini key
+        # (or if Google changes pricing) — see https://ai.google.dev/pricing
+        "gemini-2.5-flash": {"input": 0.30, "output": 2.50},
+        "gemini-2.5-flash-lite": {"input": 0.10, "output": 0.40},
+        "gemini-2.0-flash": {"input": 0.10, "output": 0.40},
     }
     summary = []
     for model, requests, total_input, total_output in rows:
         total_input = total_input or 0
         total_output = total_output or 0
         # LiteLlm model names are provider-prefixed (e.g.
-        # "anthropic/claude-sonnet-4-5") — strip the prefix so this
-        # matches the same rate table the main project uses.
+        # "anthropic/claude-sonnet-4-5"); native Gemini names (e.g.
+        # "gemini-2.5-flash") have no prefix. Strip one if present so
+        # this matches the rate table either way.
         bare_model = model.split("/", 1)[-1] if model else model
         rates = rate_per_million.get(bare_model, {"input": 0, "output": 0})
         est_cost = (total_input / 1_000_000 * rates["input"]) + (total_output / 1_000_000 * rates["output"])

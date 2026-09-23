@@ -11,11 +11,10 @@ require_confirmation=True), and per-turn KB retrieval via {kb_context}.
 """
 
 from google.adk.agents import Agent
-from google.adk.models.lite_llm import LiteLlm
 
 from common.booking_gate import make_intercept_book_class, make_log_usage, make_resolve_pending_booking
 from common.booking_tools import book_class
-from common.config import RULES, TRIBE_APP_MODEL, TRIBE_APP_SYSTEM_PROMPT
+from common.config import RULES, TRIBE_APP_MODEL, TRIBE_APP_SYSTEM_PROMPT, resolve_model
 from common.schedule_tools import check_availability, get_schedule
 
 AGENT_SLUG = "tribe-app"
@@ -33,7 +32,7 @@ INSTRUCTION = (
 
 root_agent = Agent(
     name="reset_fitness_tribe_app",
-    model=LiteLlm(model=TRIBE_APP_MODEL),
+    model=resolve_model(TRIBE_APP_MODEL),
     instruction=INSTRUCTION,
     description="Helps Reset Fitness app members check class schedules and book classes.",
     tools=[get_schedule, check_availability, book_class],

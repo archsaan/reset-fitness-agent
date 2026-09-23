@@ -90,13 +90,37 @@ MOCK_ADMIN_TOKEN = os.environ.get("MOCK_ADMIN_TOKEN", "dev-admin-token-change-me
 # ---------------------------------------------------------
 # Models
 # ---------------------------------------------------------
-# ADK talks to Claude/Grok through LiteLlm (google.adk.models.lite_llm),
-# using the same provider-prefixed names LiteLLM expects. LiteLLM reads
-# ANTHROPIC_API_KEY / XAI_API_KEY from the environment itself, same vars
-# as the main project — nothing extra to configure here.
+# Two families of model name are supported here:
+#   - "gemini-..."         -> ADK's NATIVE Gemini support. No LiteLlm
+#                              wrapper needed; ADK reads GOOGLE_API_KEY
+#                              straight from the environment. Get a free
+#                              key at https://aistudio.google.com/apikey —
+#                              gemini-2.5-flash has a genuinely free tier
+#                              (rate-limited, not a trial), which is why
+#                              it's the default below.
+#   - "anthropic/..." etc. -> everything else still goes through LiteLlm
+#                              (google.adk.models.lite_llm), same as
+#                              before. LiteLLM reads ANTHROPIC_API_KEY /
+#                              XAI_API_KEY from the environment itself.
+#
+# Defaulted to Gemini so a fresh checkout costs nothing to run; set
+# TRIBE_APP_MODEL / PFC_MODEL back to "anthropic/claude-sonnet-4-5" (or
+# any other LiteLLM-style name) in .env to switch an agent back to Claude.
 
-TRIBE_APP_MODEL = os.environ.get("TRIBE_APP_MODEL", "anthropic/claude-sonnet-4-5")
-PFC_MODEL = os.environ.get("PFC_MODEL", "anthropic/claude-sonnet-4-5")
+TRIBE_APP_MODEL = os.environ.get("TRIBE_APP_MODEL", "gemini-2.5-flash")
+PFC_MODEL = os.environ.get("PFC_MODEL", "gemini-2.5-flash")
+
+
+def resolve_model(model_name: str):
+    """Turns a config model name into whatever ADK's Agent(model=...)
+    actually expects: a plain string for native Gemini, or a LiteLlm
+    instance for anything else (Claude, Grok, ...). Import of LiteLlm is
+    local so agents that only ever use Gemini don't need it installed/
+    importable at all."""
+    if model_name.startswith("gemini-") or model_name.startswith("gemini/"):
+        return model_name[len("gemini/"):] if model_name.startswith("gemini/") else model_name
+    from google.adk.models.lite_llm import LiteLlm
+    return LiteLlm(model=model_name)
 
 # ---------------------------------------------------------
 # Shared rules text — identical wording to the main project's RULES,
