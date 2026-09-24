@@ -114,8 +114,8 @@ MOCK_ADMIN_TOKEN = os.environ.get("MOCK_ADMIN_TOKEN", "dev-admin-token-change-me
 # currently serves as the free-tier flash model and override via
 # TRIBE_APP_MODEL / PFC_MODEL in .env — no code change needed either way.
 
-TRIBE_APP_MODEL = os.environ.get("TRIBE_APP_MODEL", "gemini-3.6-flash")
-PFC_MODEL = os.environ.get("PFC_MODEL", "gemini-3.6-flash")
+TRIBE_APP_MODEL = os.environ.get("TRIBE_APP_MODEL", "gemini-3.5-flash-lite")
+PFC_MODEL = os.environ.get("PFC_MODEL", "gemini-3.5-flash-lite")
 
 
 def resolve_model(model_name: str):
