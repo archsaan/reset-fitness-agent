@@ -40,7 +40,7 @@ def _ensure_ready() -> None:
     but `adk web` (ADK's own dev-UI entrypoint) imports tribe_app/agent.py
     and pfc/agent.py directly — it never runs main.py at all, so that
     explicit call never happens. Without this, every KB read/write fails
-    with `UndefinedTable: relation "kb_docs" does not exist` the moment
+    with `UndefinedTable: relation "adk_kb_docs" does not exist` the moment
     you run `adk web` instead of `uvicorn main:app`. Calling this at the
     top of every public function below means the schema gets created
     automatically no matter which entrypoint is used, instead of relying
@@ -57,12 +57,39 @@ def init_kb_store() -> None:
     plain (unregistered) connection for the CREATE EXTENSION step, same
     reasoning as the main project: the `vector` type doesn't exist yet on
     a brand new database until that statement runs, so register_vector()
-    would fail if called first."""
+    would fail if called first.
+
+    Table names are prefixed `adk_` — NOT cosmetic. This project shares
+    one Neon database with the main (LangGraph) project on purpose (see
+    the module docstring), but the two projects' KB schemas are
+    incompatible: the main project's `app/db/vector_store.py` already
+    owns a table literally named `kb_chunks`, with its `doc_id` foreign
+    key pointing at ITS docs table (`knowledge_base_docs`), not this
+    project's old `kb_docs`. Before this prefix existed, this project's
+    own `CREATE TABLE IF NOT EXISTS kb_chunks` was a silent no-op against
+    the main project's already-existing table — every insert here then
+    failed with `violates foreign key constraint ... Key (doc_id)=(5) is
+    not present in table "knowledge_base_docs"`, because doc_id 5 was a
+    row in THIS project's kb_docs, not the main project's docs table.
+    Unique table names side-step the collision entirely instead of
+    trying to reconcile two different foreign-key schemas sharing one
+    physical table."""
     conn = psycopg.connect(DATABASE_URL, autocommit=False)
     with conn.cursor() as cur:
         cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
+        # One-time migration: this project's OWN docs table used to be
+        # named `kb_docs` (never shared with the main project — only
+        # kb_chunks collided). Renaming preserves any docs already
+        # uploaded (e.g. doc_id 5) instead of orphaning them. Safe to run
+        # every startup: no-op once the rename has already happened.
         cur.execute("""
-            CREATE TABLE IF NOT EXISTS kb_docs (
+            SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'kb_docs')
+               AND NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'adk_kb_docs')
+        """)
+        if cur.fetchone()[0]:
+            cur.execute("ALTER TABLE kb_docs RENAME TO adk_kb_docs")
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS adk_kb_docs (
                 id SERIAL PRIMARY KEY,
                 agent_slug TEXT NOT NULL,
                 filename TEXT NOT NULL,
@@ -71,10 +98,14 @@ def init_kb_store() -> None:
                 uploaded_at TIMESTAMPTZ DEFAULT NOW()
             )
         """)
+        # Deliberately NOT `kb_chunks` — see the docstring above. This is
+        # a brand-new table the first time this migration runs, so any
+        # rows that failed to insert under the old name are simply gone;
+        # re-upload/re-index the affected doc(s) after deploying this.
         cur.execute(f"""
-            CREATE TABLE IF NOT EXISTS kb_chunks (
+            CREATE TABLE IF NOT EXISTS adk_kb_chunks (
                 id SERIAL PRIMARY KEY,
-                doc_id INTEGER NOT NULL REFERENCES kb_docs(id) ON DELETE CASCADE,
+                doc_id INTEGER NOT NULL REFERENCES adk_kb_docs(id) ON DELETE CASCADE,
                 agent_slug TEXT NOT NULL,
                 chunk_text TEXT NOT NULL,
                 embedding VECTOR({EMBEDDING_DIM})
@@ -94,7 +125,7 @@ def init_kb_store() -> None:
         # No ivfflat/hnsw index yet — same reasoning as the main project:
         # at this KB scale a sequential scan is exact and effectively
         # instant, and an approximate index this early can silently hurt
-        # recall. Add one back only once kb_chunks is genuinely large
+        # recall. Add one back only once adk_kb_chunks is genuinely large
         # (tens of thousands of rows).
     conn.commit()
     conn.close()
@@ -174,7 +205,7 @@ def list_kb_docs(agent_slug: str) -> list[dict]:
     conn = psycopg.connect(DATABASE_URL)
     with conn.cursor(row_factory=dict_row) as cur:
         cur.execute(
-            "SELECT id, filename, active, uploaded_at FROM kb_docs "
+            "SELECT id, filename, active, uploaded_at FROM adk_kb_docs "
             "WHERE agent_slug = %s ORDER BY uploaded_at DESC",
             (agent_slug,),
         )
@@ -188,7 +219,7 @@ def insert_kb_doc(agent_slug: str, filename: str, content: str) -> int:
     conn = psycopg.connect(DATABASE_URL)
     with conn.cursor() as cur:
         cur.execute(
-            "INSERT INTO kb_docs (agent_slug, filename, content, active) "
+            "INSERT INTO adk_kb_docs (agent_slug, filename, content, active) "
             "VALUES (%s, %s, %s, TRUE) RETURNING id",
             (agent_slug, filename, content),
         )
@@ -202,13 +233,13 @@ def toggle_kb_doc(doc_id: int) -> bool | None:
     _ensure_ready()
     conn = psycopg.connect(DATABASE_URL)
     with conn.cursor() as cur:
-        cur.execute("SELECT active FROM kb_docs WHERE id = %s", (doc_id,))
+        cur.execute("SELECT active FROM adk_kb_docs WHERE id = %s", (doc_id,))
         row = cur.fetchone()
         if not row:
             conn.close()
             return None
         new_state = not row[0]
-        cur.execute("UPDATE kb_docs SET active = %s WHERE id = %s", (new_state, doc_id))
+        cur.execute("UPDATE adk_kb_docs SET active = %s WHERE id = %s", (new_state, doc_id))
     conn.commit()
     conn.close()
     return new_state
@@ -218,7 +249,7 @@ def delete_kb_doc(doc_id: int) -> None:
     _ensure_ready()
     conn = psycopg.connect(DATABASE_URL)
     with conn.cursor() as cur:
-        cur.execute("DELETE FROM kb_docs WHERE id = %s", (doc_id,))
+        cur.execute("DELETE FROM adk_kb_docs WHERE id = %s", (doc_id,))
     conn.commit()
     conn.close()
 
@@ -230,7 +261,7 @@ def get_active_kb_text(agent_slug: str) -> str:
     conn = psycopg.connect(DATABASE_URL)
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT content FROM kb_docs WHERE agent_slug = %s AND active = TRUE",
+            "SELECT content FROM adk_kb_docs WHERE agent_slug = %s AND active = TRUE",
             (agent_slug,),
         )
         rows = cur.fetchall()
@@ -257,10 +288,10 @@ def index_kb_doc(doc_id: int, agent_slug: str, content: str) -> int:
 
     conn = _get_vector_conn()
     with conn.cursor() as cur:
-        cur.execute("DELETE FROM kb_chunks WHERE doc_id = %s", (doc_id,))
+        cur.execute("DELETE FROM adk_kb_chunks WHERE doc_id = %s", (doc_id,))
         for chunk_text_, embedding in zip(chunks, embeddings):
             cur.execute(
-                "INSERT INTO kb_chunks (doc_id, agent_slug, chunk_text, embedding) VALUES (%s, %s, %s, %s)",
+                "INSERT INTO adk_kb_chunks (doc_id, agent_slug, chunk_text, embedding) VALUES (%s, %s, %s, %s)",
                 (doc_id, agent_slug, chunk_text_, Vector(embedding)),
             )
     conn.commit()
@@ -272,7 +303,7 @@ def has_any_chunks(agent_slug: str) -> bool:
     _ensure_ready()
     conn = psycopg.connect(DATABASE_URL)
     with conn.cursor() as cur:
-        cur.execute("SELECT EXISTS (SELECT 1 FROM kb_chunks WHERE agent_slug = %s LIMIT 1)", (agent_slug,))
+        cur.execute("SELECT EXISTS (SELECT 1 FROM adk_kb_chunks WHERE agent_slug = %s LIMIT 1)", (agent_slug,))
         exists = cur.fetchone()[0]
     conn.close()
     return exists
@@ -283,11 +314,11 @@ def search_similar_chunks(agent_slug: str, query_embedding: list[float], top_k: 
     conn = _get_vector_conn()
     with conn.cursor() as cur:
         cur.execute("""
-            SELECT kb_chunks.chunk_text
-            FROM kb_chunks
-            JOIN kb_docs ON kb_docs.id = kb_chunks.doc_id
-            WHERE kb_docs.active = TRUE AND kb_chunks.agent_slug = %s
-            ORDER BY kb_chunks.embedding <=> %s
+            SELECT adk_kb_chunks.chunk_text
+            FROM adk_kb_chunks
+            JOIN adk_kb_docs ON adk_kb_docs.id = adk_kb_chunks.doc_id
+            WHERE adk_kb_docs.active = TRUE AND adk_kb_chunks.agent_slug = %s
+            ORDER BY adk_kb_chunks.embedding <=> %s
             LIMIT %s
         """, (agent_slug, Vector(query_embedding), top_k))
         rows = cur.fetchall()
