@@ -106,9 +106,16 @@ MOCK_ADMIN_TOKEN = os.environ.get("MOCK_ADMIN_TOKEN", "dev-admin-token-change-me
 # Defaulted to Gemini so a fresh checkout costs nothing to run; set
 # TRIBE_APP_MODEL / PFC_MODEL back to "anthropic/claude-sonnet-4-5" (or
 # any other LiteLLM-style name) in .env to switch an agent back to Claude.
+#
+# NOTE: gemini-2.5-flash was retired for new API keys (Google's API now
+# 404s with NOT_FOUND and points to gemini-3.6-flash instead), so that's
+# the default here. If your key still 404s on this, check
+# https://ai.google.dev/gemini-api/docs/models for whatever name Google
+# currently serves as the free-tier flash model and override via
+# TRIBE_APP_MODEL / PFC_MODEL in .env — no code change needed either way.
 
-TRIBE_APP_MODEL = os.environ.get("TRIBE_APP_MODEL", "gemini-2.5-flash")
-PFC_MODEL = os.environ.get("PFC_MODEL", "gemini-2.5-flash")
+TRIBE_APP_MODEL = os.environ.get("TRIBE_APP_MODEL", "gemini-3.6-flash")
+PFC_MODEL = os.environ.get("PFC_MODEL", "gemini-3.6-flash")
 
 
 def resolve_model(model_name: str):

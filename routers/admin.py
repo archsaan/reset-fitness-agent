@@ -190,9 +190,15 @@ def _summarize_usage(rows) -> list[dict]:
         # rates only, so estimated_cost_usd will overstate cost while
         # you're on the free key. Update once you're on a paid Gemini key
         # (or if Google changes pricing) — see https://ai.google.dev/pricing
+        # gemini-2.5-flash retired for new API keys — kept here in case
+        # older usage_logs rows still reference it. gemini-3.6-flash is
+        # the current default; its per-million rate isn't filled in yet
+        # (check https://ai.google.dev/pricing), so its estimated cost
+        # will show as $0 until you fill it in here.
         "gemini-2.5-flash": {"input": 0.30, "output": 2.50},
         "gemini-2.5-flash-lite": {"input": 0.10, "output": 0.40},
         "gemini-2.0-flash": {"input": 0.10, "output": 0.40},
+        "gemini-3.6-flash": {"input": 0, "output": 0},
     }
     summary = []
     for model, requests, total_input, total_output in rows:
