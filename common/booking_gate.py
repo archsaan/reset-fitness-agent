@@ -30,10 +30,14 @@ Both agents (tribe_app, pfc) register both callbacks identically; see
 their agent.py files.
 """
 
+import logging
+
 from google.genai import types
 
 from common.booking_tools import execute_booking
 from common.kb import get_kb_context, log_usage
+
+logger = logging.getLogger("reset_fitness_adk.booking_gate")
 
 # Deny-by-default — identical wordlists to app/agent/graph.py's
 # _is_affirmative, on purpose: this gates a real booking, so an ambiguous
@@ -114,7 +118,24 @@ def make_resolve_pending_booking(agent_slug: str):
         if pending:
             state["pending_booking"] = None  # clear regardless of outcome
             if _is_affirmative(user_text):
-                result = execute_booking(**pending)
+                try:
+                    result = execute_booking(**pending)
+                except Exception:
+                    # A real HTTP call to ProfitConnect that times out or
+                    # errors must never crash the whole turn — the member
+                    # would just see a broken chat with no explanation.
+                    # Logged loudly (this is exactly the kind of failure
+                    # that needs a human to notice and check whether the
+                    # booking actually went through on ProfitConnect's
+                    # side despite the error), and degrades to a plain
+                    # apologetic reply instead.
+                    logger.exception(
+                        "execute_booking raised for agent_slug=%s pending=%s", agent_slug, pending
+                    )
+                    result = {
+                        "success": False,
+                        "reason": "Something went wrong reaching the booking system. Please try again in a moment.",
+                    }
             else:
                 result = {
                     "success": False,
@@ -154,7 +175,11 @@ def make_log_usage(agent_slug: str, model_name: str):
                 usage.candidates_token_count or 0,
             )
         except Exception:
-            pass  # usage logging is an observability nice-to-have, never worth failing a real chat turn over
+            # Usage logging is an observability nice-to-have, never worth
+            # failing a real chat turn over — but a silently swallowed
+            # DB error is itself an observability gap (you'd never know
+            # usage_logs stopped filling in), so it's logged, not passed.
+            logger.exception("Failed to log usage for agent %s, session %s", agent_slug, session_id)
         return None
 
     return log_usage_callback

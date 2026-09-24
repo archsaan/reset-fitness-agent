@@ -107,12 +107,18 @@ MOCK_ADMIN_TOKEN = os.environ.get("MOCK_ADMIN_TOKEN", "dev-admin-token-change-me
 # TRIBE_APP_MODEL / PFC_MODEL back to "anthropic/claude-sonnet-4-5" (or
 # any other LiteLLM-style name) in .env to switch an agent back to Claude.
 #
-# NOTE: gemini-2.5-flash was retired for new API keys (Google's API now
-# 404s with NOT_FOUND and points to gemini-3.6-flash instead), so that's
-# the default here. If your key still 404s on this, check
-# https://ai.google.dev/gemini-api/docs/models for whatever name Google
-# currently serves as the free-tier flash model and override via
-# TRIBE_APP_MODEL / PFC_MODEL in .env — no code change needed either way.
+# NOTE on WHICH Gemini model: gemini-2.5-flash was retired for new API
+# keys, and its replacement gemini-3.6-flash turned out to be capped at
+# a stingy 20 requests/day on the free tier (confirmed directly against
+# this project's own quota page, https://aistudio.google.com/rate-limit).
+# Checking that page across every model showed a clear pattern: every
+# plain "Flash" model (2.5, 3, 3.5, 3.6, 3.7, 3.8 Flash) is capped at
+# 20 RPD, but the "Flash Lite" variants get 500 RPD instead — 25x more
+# headroom for the same $0. gemini-3.5-flash-lite is confirmed working
+# on this project's key, hence the default below. If Google reshuffles
+# quotas again, re-check https://aistudio.google.com/rate-limit and
+# override via TRIBE_APP_MODEL / PFC_MODEL in .env — no code change
+# needed either way.
 
 TRIBE_APP_MODEL = os.environ.get("TRIBE_APP_MODEL", "gemini-3.5-flash-lite")
 PFC_MODEL = os.environ.get("PFC_MODEL", "gemini-3.5-flash-lite")
