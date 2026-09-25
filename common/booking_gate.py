@@ -91,9 +91,12 @@ def make_intercept_book_class(agent_slug: str):
             return None  # not our tool — let every other tool run normally
 
         tool_context.state["pending_booking"] = dict(args)
+        CONFIRM_SENTINEL = "[confirm_buttons]"
+
         question = (
             f"Please confirm: book {args.get('class_name')} on {args.get('target_date')} "
             f"at {args.get('start_time')} for {args.get('lead_name')}? (yes/no)"
+            f"\n{CONFIRM_SENTINEL}"
         )
         return {"success": False, "awaiting_confirmation": True, "question": question}
 
