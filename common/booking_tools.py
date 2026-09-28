@@ -14,20 +14,18 @@ needs for Postgres-backed session persistence). Instead:
     HTTP calls. Only booking_gate.py's before_agent_callback calls it,
     and only after a member's next message reads as a clear "yes".
 
-member_id is hardcoded to TEST_MEMBER_ID for the same TEMPORARY reason as
-the main project — no real member auth wired into /chat yet. Search for
-TEST_MEMBER_ID before this goes near real members.
+member_id used to be hardcoded to TEST_MEMBER_ID. It's now a required
+argument instead — see booking_gate.py's resolve_pending_booking, which
+derives it from the real ADK session's user_id (falling back to
+TEST_MEMBER_ID only when user_id isn't a valid numeric member id, e.g.
+admin test sessions). This function no longer decides where member_id
+comes from at all; it just uses whatever it's given, which is what makes
+it safe to call for a real member once the caller supplies a real id.
 """
 
 import httpx
 
-from common.config import (
-    BOOKING_API_KEY,
-    BOOKING_CREATE_API_URL,
-    BOOKING_VALIDATE_API_URL,
-    FACILITY_ID,
-    TEST_MEMBER_ID,
-)
+from common.config import BOOKING_API_KEY, BOOKING_CREATE_API_URL, BOOKING_VALIDATE_API_URL, FACILITY_ID
 
 
 def _auth_headers() -> dict:
@@ -41,13 +39,18 @@ def _extract_failure_reason(data: dict) -> str:
     return "The booking system declined this booking."
 
 
-def execute_booking(calendar_schedule_id: int, class_name: str, target_date: str, start_time: str, lead_name: str) -> dict:
+def execute_booking(
+    member_id: int, calendar_schedule_id: int, class_name: str, target_date: str, start_time: str, lead_name: str
+) -> dict:
     """The real validate -> book HTTP flow. Call this directly only from
     booking_gate.py, only once a member has explicitly confirmed. Never
     call this from the book_class tool body — that's the whole point of
-    the approval gate."""
-    member_id = TEST_MEMBER_ID  # TEMPORARY — see module docstring.
+    the approval gate.
 
+    member_id is now a required caller-supplied argument (see module
+    docstring) — this function does no fallback/default of its own, so a
+    wrong or missing id is the caller's bug to fix, not something this
+    function should paper over."""
     try:
         validate_resp = httpx.post(
             BOOKING_VALIDATE_API_URL,

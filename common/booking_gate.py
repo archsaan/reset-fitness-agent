@@ -35,7 +35,9 @@ import logging
 from google.genai import types
 
 from common.booking_tools import execute_booking
+from common.config import TEST_MEMBER_ID
 from common.kb import get_kb_context, log_usage
+from common.safety import log_if_injection_attempt
 
 logger = logging.getLogger("reset_fitness_adk.booking_gate")
 
@@ -70,6 +72,33 @@ def _latest_user_text(callback_context) -> str:
     return ""
 
 
+def _resolve_member_id(session, agent_slug: str) -> int:
+    """Real member id comes from the session's own user_id — whatever
+    called runner.run_async(user_id=..., ...) to start this conversation
+    is the one place that actually knows who's chatting. Once real member
+    auth is wired into the chat entrypoint, that caller should pass the
+    member's real ProfitConnect id as user_id, and it'll flow through
+    here automatically — no change needed in this file at that point.
+
+    Falls back to TEST_MEMBER_ID (logged loudly, not silently) whenever
+    user_id isn't a plain integer — covers the admin dashboard's
+    "admin-test-user" and any other non-member session, so those keep
+    working exactly as before instead of crashing on int(). If a REAL
+    member session ever hits this fallback, that's a bug in the caller
+    (real member ids should always be numeric) — the warning is what
+    surfaces that instead of it silently booking under the test id."""
+    user_id = getattr(session, "user_id", None)
+    try:
+        return int(user_id)
+    except (TypeError, ValueError):
+        logger.warning(
+            "No numeric member id on session (agent=%s, user_id=%r) — falling back to "
+            "TEST_MEMBER_ID=%s. Expected for admin/test sessions; a bug if this is a real member.",
+            agent_slug, user_id, TEST_MEMBER_ID,
+        )
+        return TEST_MEMBER_ID
+
+
 def _format_booking_result(result: dict) -> str:
     if result.get("success"):
         b = result["booking"]
@@ -91,12 +120,9 @@ def make_intercept_book_class(agent_slug: str):
             return None  # not our tool — let every other tool run normally
 
         tool_context.state["pending_booking"] = dict(args)
-        CONFIRM_SENTINEL = "[confirm_buttons]"
-
         question = (
             f"Please confirm: book {args.get('class_name')} on {args.get('target_date')} "
             f"at {args.get('start_time')} for {args.get('lead_name')}? (yes/no)"
-            f"\n{CONFIRM_SENTINEL}"
         )
         return {"success": False, "awaiting_confirmation": True, "question": question}
 
@@ -117,21 +143,17 @@ def make_resolve_pending_booking(agent_slug: str):
         state = callback_context.state
         user_text = _latest_user_text(callback_context)
 
+        session = getattr(callback_context, "session", None)
+        log_if_injection_attempt(agent_slug, getattr(session, "id", "unknown"), user_text)
+
         pending = state.get("pending_booking")
         if pending:
             state["pending_booking"] = None  # clear regardless of outcome
             if _is_affirmative(user_text):
                 try:
-                    result = execute_booking(**pending)
+                    member_id = _resolve_member_id(session, agent_slug)
+                    result = execute_booking(member_id=member_id, **pending)
                 except Exception:
-                    # A real HTTP call to ProfitConnect that times out or
-                    # errors must never crash the whole turn — the member
-                    # would just see a broken chat with no explanation.
-                    # Logged loudly (this is exactly the kind of failure
-                    # that needs a human to notice and check whether the
-                    # booking actually went through on ProfitConnect's
-                    # side despite the error), and degrades to a plain
-                    # apologetic reply instead.
                     logger.exception(
                         "execute_booking raised for agent_slug=%s pending=%s", agent_slug, pending
                     )
@@ -147,9 +169,6 @@ def make_resolve_pending_booking(agent_slug: str):
             reply_text = _format_booking_result(result)
             return types.Content(role="model", parts=[types.Part(text=reply_text)])
 
-        # No pending booking — proceed to the model as normal, but first
-        # refresh {kb_context} for this turn's instruction (the ADK
-        # equivalent of build_system_prompt() re-running every request).
         state["kb_context"] = get_kb_context(agent_slug, user_text)
         return None
 
@@ -158,9 +177,7 @@ def make_resolve_pending_booking(agent_slug: str):
 
 def make_log_usage(agent_slug: str, model_name: str):
     """after_model_callback — logs each real model call's token usage to
-    usage_logs, the ADK equivalent of graph.py's log_usage() call in the
-    main project (called from agent_node there, after every model
-    invoke). Read-only w.r.t. the response: always returns None so the
+    usage_logs. Read-only w.r.t. the response: always returns None so the
     actual model output is never altered, only observed."""
 
     def log_usage_callback(callback_context, llm_response):
@@ -178,10 +195,6 @@ def make_log_usage(agent_slug: str, model_name: str):
                 usage.candidates_token_count or 0,
             )
         except Exception:
-            # Usage logging is an observability nice-to-have, never worth
-            # failing a real chat turn over — but a silently swallowed
-            # DB error is itself an observability gap (you'd never know
-            # usage_logs stopped filling in), so it's logged, not passed.
             logger.exception("Failed to log usage for agent %s, session %s", agent_slug, session_id)
         return None
 
