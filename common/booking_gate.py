@@ -106,6 +106,15 @@ def _format_booking_result(result: dict) -> str:
             f"You're booked! {b['class_name']} on {b['date']} at {b['start_time']} "
             f"for {b['lead_name']}. See you there! \U0001F389"
         )
+    if result.get("declined"):
+        # The member just said no — not a system failure, so this should
+        # never read like one. "I couldn't complete that booking: <reason>"
+        # is meant for REAL failures (ProfitConnect down, validation
+        # rejected, etc.), where the member benefits from knowing why.
+        # Surfacing that same wording for a plain "no" reads like an
+        # error occurred, which is confusing/off-putting for something
+        # that's actually just the member declining.
+        return "No worries! Let me know if you'd like to book something else. \U0001F60A"
     return f"I couldn't complete that booking: {result.get('reason', 'unknown error')}"
 
 
@@ -162,10 +171,12 @@ def make_resolve_pending_booking(agent_slug: str):
                         "reason": "Something went wrong reaching the booking system. Please try again in a moment.",
                     }
             else:
-                result = {
-                    "success": False,
-                    "reason": "The member did not confirm, so this booking was not made.",
-                }
+                # declined=True, not a "reason" string — this is the
+                # member choosing not to book, never an error, and
+                # _format_booking_result gives it its own friendly wording
+                # instead of the generic "I couldn't complete that
+                # booking: <reason>" phrasing meant for real failures.
+                result = {"success": False, "declined": True}
             reply_text = _format_booking_result(result)
             return types.Content(role="model", parts=[types.Part(text=reply_text)])
 
