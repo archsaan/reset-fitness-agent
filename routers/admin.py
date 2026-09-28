@@ -370,7 +370,19 @@ async def test_chat_route(agent_slug: str, payload: dict, authorization: str = H
             if texts:
                 reply_text = "".join(texts)
 
-    # session_id is new here on purpose: the dashboard needs to send it
-    # back on the NEXT message of this same test conversation, or the
-    # confirmation gate (and anything else multi-turn) can't be tested.
-    return {"reply": reply_text, "session_id": session_id}
+    # Read whether a booking is now pending straight out of real session
+    # state, rather than trying to detect it from the model's reply text —
+    # Gemini paraphrases the confirmation question, so text-matching broke
+    # in live testing. pending_booking is set directly in session state by
+    # booking_gate.py's intercept_book_class, so this is reliable
+    # regardless of how the model phrases anything.
+    session = await runner.session_service.get_session(
+        app_name=runner.app_name, user_id=user_id, session_id=session_id
+    )
+    awaiting_confirmation = bool(session and session.state.get("pending_booking"))
+
+    return {
+        "reply": reply_text,
+        "session_id": session_id,
+        "awaiting_confirmation": awaiting_confirmation,
+    }
