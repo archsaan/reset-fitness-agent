@@ -12,6 +12,7 @@ COPY common ./common
 COPY routers ./routers
 COPY tribe_app ./tribe_app
 COPY pfc ./pfc
+COPY member_goal_setter ./member_goal_setter
 COPY main.py .
 
 ENV PORT=8080
