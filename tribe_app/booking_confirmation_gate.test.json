@@ -1,0 +1,135 @@
+{
+  "eval_set_id": "tribe_app_booking_confirmation_gate",
+  "name": "book_class always follows check_availability, and a real booking only happens after an explicit yes",
+  "eval_cases": [
+    {
+      "eval_id": "confirm_then_yes",
+      "conversation": [
+        {
+          "invocation_id": "1",
+          "user_content": {
+            "parts": [
+              {
+                "text": "I'd like to book Hurricane today, my name is Sam"
+              }
+            ],
+            "role": "user"
+          },
+          "final_response": {
+            "parts": [
+              {
+                "text": "(asks to confirm — yes/no)"
+              }
+            ],
+            "role": "model"
+          },
+          "intermediate_data": {
+            "tool_uses": [
+              {
+                "args": {
+                  "class_name": "Hurricane"
+                },
+                "name": "check_availability"
+              }
+            ],
+            "tool_responses": [],
+            "intermediate_responses": []
+          },
+          "creation_timestamp": 0.0
+        },
+        {
+          "invocation_id": "2",
+          "user_content": {
+            "parts": [
+              {
+                "text": "yes"
+              }
+            ],
+            "role": "user"
+          },
+          "final_response": {
+            "parts": [
+              {
+                "text": "You're booked!"
+              }
+            ],
+            "role": "model"
+          },
+          "creation_timestamp": 0.0
+        }
+      ],
+      "session_input": {
+        "app_name": "tribe-app-eval",
+        "user_id": "eval-user",
+        "state": {}
+      },
+      "creation_timestamp": 0.0,
+      "final_session_state": {}
+    },
+    {
+      "eval_id": "confirm_then_no",
+      "conversation": [
+        {
+          "invocation_id": "1",
+          "user_content": {
+            "parts": [
+              {
+                "text": "I'd like to book Hurricane today, my name is Sam"
+              }
+            ],
+            "role": "user"
+          },
+          "final_response": {
+            "parts": [
+              {
+                "text": "(asks to confirm — yes/no)"
+              }
+            ],
+            "role": "model"
+          },
+          "intermediate_data": {
+            "tool_uses": [
+              {
+                "args": {
+                  "class_name": "Hurricane"
+                },
+                "name": "check_availability"
+              }
+            ],
+            "tool_responses": [],
+            "intermediate_responses": []
+          },
+          "creation_timestamp": 0.0
+        },
+        {
+          "invocation_id": "2",
+          "user_content": {
+            "parts": [
+              {
+                "text": "no"
+              }
+            ],
+            "role": "user"
+          },
+          "final_response": {
+            "parts": [
+              {
+                "text": "I couldn't complete that booking: The member did not confirm, so this booking was not made."
+              }
+            ],
+            "role": "model"
+          },
+          "creation_timestamp": 0.0
+        }
+      ],
+      "session_input": {
+        "app_name": "tribe-app-eval",
+        "user_id": "eval-user",
+        "state": {}
+      },
+      "creation_timestamp": 0.0,
+      "final_session_state": {}
+    }
+  ],
+  "creation_timestamp": 0.0
+}

@@ -1,0 +1,49 @@
+{
+  "eval_set_id": "tribe_app_schedule_lookup",
+  "name": "A general schedule question triggers get_schedule, never static text",
+  "eval_cases": [
+    {
+      "eval_id": "whats_on_today",
+      "conversation": [
+        {
+          "invocation_id": "1",
+          "user_content": {
+            "parts": [
+              {
+                "text": "What classes are on today?"
+              }
+            ],
+            "role": "user"
+          },
+          "final_response": {
+            "parts": [
+              {
+                "text": "(live schedule reply)"
+              }
+            ],
+            "role": "model"
+          },
+          "intermediate_data": {
+            "tool_uses": [
+              {
+                "args": {},
+                "name": "get_schedule"
+              }
+            ],
+            "tool_responses": [],
+            "intermediate_responses": []
+          },
+          "creation_timestamp": 0.0
+        }
+      ],
+      "session_input": {
+        "app_name": "tribe-app-eval",
+        "user_id": "eval-user",
+        "state": {}
+      },
+      "creation_timestamp": 0.0,
+      "final_session_state": {}
+    }
+  ],
+  "creation_timestamp": 0.0
+}

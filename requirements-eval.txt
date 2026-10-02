@@ -1,0 +1,15 @@
+# Dev-only deps for running the eval suite (eval/test_agent_evals.py).
+# Deliberately NOT in the project's main requirements.txt — Render only
+# needs to run main.py, and pytest/vertexai (a transitive dep of ADK's
+# [eval] extra, even though these evals don't use anything Vertex-specific)
+# have no business being installed on the production server.
+#
+# Install once, locally, before running evals:
+#   pip install -r eval/requirements-eval.txt --break-system-packages
+#
+# (--break-system-packages only needed if you're not in a venv — a venv
+# is the better long-term move but out of scope for this change.)
+
+google-adk[eval]==2.9.2
+pytest
+pytest-asyncio

@@ -1,0 +1,44 @@
+{
+  "eval_set_id": "pfc_off_topic_refusal",
+  "name": "Off-topic questions get the RULES fallback, never a guess",
+  "eval_cases": [
+    {
+      "eval_id": "where_is_earth",
+      "conversation": [
+        {
+          "invocation_id": "1",
+          "user_content": {
+            "parts": [
+              {
+                "text": "where is earth"
+              }
+            ],
+            "role": "user"
+          },
+          "final_response": {
+            "parts": [
+              {
+                "text": "Our team will have all the details and will be in touch with you very shortly! 😊"
+              }
+            ],
+            "role": "model"
+          },
+          "intermediate_data": {
+            "tool_uses": [],
+            "tool_responses": [],
+            "intermediate_responses": []
+          },
+          "creation_timestamp": 0.0
+        }
+      ],
+      "session_input": {
+        "app_name": "pfc-eval",
+        "user_id": "eval-user",
+        "state": {}
+      },
+      "creation_timestamp": 0.0,
+      "final_session_state": {}
+    }
+  ],
+  "creation_timestamp": 0.0
+}
