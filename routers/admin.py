@@ -15,6 +15,7 @@ So this router implements:
   - DELETE /admin/agents/{agent_slug}/knowledge-base/{doc_id}
   - GET    /admin/usage                                (global usage summary)
   - GET    /admin/agents/{agent_slug}/usage                     (per-agent usage summary)
+  - GET    /admin/agents/{agent_slug}/session-stats              (longest real conversations, diagnostics only)
   - POST   /admin/agents/{agent_slug}/test-chat                 (throwaway ADK session, real reply)
 
 NOT implemented on purpose: POST/DELETE /admin/agents (create/delete —
@@ -42,7 +43,17 @@ from fastapi import APIRouter, File, Header, HTTPException, UploadFile
 from google.genai import types
 
 from common.agent_config import get_system_prompt, reset_system_prompt, set_system_prompt
-from common.config import MOCK_ADMIN_TOKEN, PFC_MODEL, PFC_SYSTEM_PROMPT, TRIBE_APP_MODEL, TRIBE_APP_SYSTEM_PROMPT
+from common.config import (
+    AI_COACH_MODEL,
+    AI_COACH_SYSTEM_PROMPT,
+    MEMBER_GOAL_SETTER_MODEL,
+    MEMBER_GOAL_SETTER_SYSTEM_PROMPT,
+    MOCK_ADMIN_TOKEN,
+    PFC_MODEL,
+    PFC_SYSTEM_PROMPT,
+    TRIBE_APP_MODEL,
+    TRIBE_APP_SYSTEM_PROMPT,
+)
 from common.kb import (
     delete_kb_doc,
     get_usage_summary,
@@ -51,6 +62,7 @@ from common.kb import (
     list_kb_docs,
     toggle_kb_doc,
 )
+from common.session_stats import get_session_length_stats
 
 logger = logging.getLogger("reset_fitness_adk.admin")
 
@@ -100,6 +112,20 @@ _AGENTS = [
         "description": "Helps Reset Fitness studio staff with CRM/ProfitConnect activities.",
         "active_model": PFC_MODEL,
     },
+    {
+        "id": "ai-coach",
+        "slug": "ai-coach",
+        "name": "AI Coach Agent",
+        "description": "Proactively checks in on members (event-driven nudges) and chats with them like any other assistant when they reply.",
+        "active_model": AI_COACH_MODEL,
+    },
+    {
+        "id": "member-goal-setter",
+        "slug": "member-goal-setter",
+        "name": "Member Goal Setter",
+        "description": "Asks a member their fitness goal and workout frequency, then recommends their first weekly goal using a deterministic rule table.",
+        "active_model": MEMBER_GOAL_SETTER_MODEL,
+    },
 ]
 
 # Hardcoded fallback persona per agent — what get_system_prompt() returns
@@ -108,6 +134,8 @@ _AGENTS = [
 _DEFAULT_PROMPTS = {
     "tribe-app": TRIBE_APP_SYSTEM_PROMPT,
     "pfc": PFC_SYSTEM_PROMPT,
+    "ai-coach": AI_COACH_SYSTEM_PROMPT,
+    "member-goal-setter": MEMBER_GOAL_SETTER_SYSTEM_PROMPT,
 }
 
 
@@ -124,6 +152,12 @@ def _root_agent_for(agent_slug: str):
         return root_agent
     if agent_slug == "pfc":
         from pfc.agent import root_agent
+        return root_agent
+    if agent_slug == "ai-coach":
+        from ai_coach.agent import root_agent
+        return root_agent
+    if agent_slug == "member-goal-setter":
+        from member_goal_setter.agent import root_agent
         return root_agent
     raise HTTPException(status_code=404, detail="Agent not found")
 
@@ -300,6 +334,22 @@ def get_agent_usage(agent_slug: str, authorization: str = Header(None)):
 
 
 # ---------------------------------------------------------
+# Session-length stats — diagnostics only, not a fix. See
+# common/session_stats.py's module docstring for the full reasoning: this
+# exists to show whether ADK's "resend full history every turn" behavior
+# is actually producing long/expensive real conversations before building
+# compaction or trimming for a problem that might not exist yet at this
+# project's scale.
+# ---------------------------------------------------------
+
+@router.get("/agents/{agent_slug}/session-stats")
+def get_agent_session_stats(agent_slug: str, authorization: str = Header(None)):
+    _require_admin(authorization)
+    _get_agent_or_404(agent_slug)
+    return get_session_length_stats(agent_slug)
+
+
+# ---------------------------------------------------------
 # Test chat (scoped to an agent, throwaway session — same guarantee as
 # the main project's test-chat: never touches real member/staff history)
 # ---------------------------------------------------------
@@ -371,16 +421,22 @@ async def test_chat_route(agent_slug: str, payload: dict, authorization: str = H
                 reply_text = "".join(texts)
 
     # Read whether a booking is now pending straight out of real session
-    # state, rather than trying to detect it from the model's reply text —
-    # Gemini paraphrases the confirmation question, so text-matching broke
-    # in live testing. pending_booking is set directly in session state by
-    # booking_gate.py's intercept_book_class, so this is reliable
-    # regardless of how the model phrases anything.
+    # state, rather than trying to detect it from the model's reply text.
+    # An earlier version appended a sentinel string to the confirmation
+    # question and had the frontend look for it — that broke the first
+    # time Gemini paraphrased the question (it added an emoji and
+    # reworded it in real testing, which would've silently dropped any
+    # appended marker too). `pending_booking` is set by
+    # booking_gate.py's intercept_book_class directly in session.state,
+    # so this is true regardless of how the model phrases anything.
     session = await runner.session_service.get_session(
         app_name=runner.app_name, user_id=user_id, session_id=session_id
     )
     awaiting_confirmation = bool(session and session.state.get("pending_booking"))
 
+    # session_id is new here on purpose: the dashboard needs to send it
+    # back on the NEXT message of this same test conversation, or the
+    # confirmation gate (and anything else multi-turn) can't be tested.
     return {
         "reply": reply_text,
         "session_id": session_id,
