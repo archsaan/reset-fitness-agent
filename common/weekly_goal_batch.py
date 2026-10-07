@@ -298,6 +298,18 @@ def run_batch(members: list[dict], mode: str, model: str, dry_run: bool = False,
 # Aggregation
 # ---------------------------------------------------------------------------
 
+# Same cadence as the real feature: one interaction per member per week
+# (every Sunday) - matches the "~4 interactions/week per 100 members"
+# framing used in the cost-comparison email to management, so these
+# numbers are directly comparable to that email's weekly/monthly figures.
+WEEKS_PER_MONTH = 4
+
+# The same 100/200/300-member scale points used in that email, so the
+# dashboard's projection table lines up with it exactly instead of
+# requiring someone to redo the arithmetic by hand.
+PROJECTION_MEMBER_SCALES = [100, 200, 300]
+
+
 def summarize(rows: list[dict]) -> dict:
     member_count = len(rows)
     total_input = sum(r["input_tokens"] for r in rows)
@@ -305,6 +317,15 @@ def summarize(rows: list[dict]) -> dict:
     total_thinking = sum(r["thinking_tokens"] for r in rows)
     total_cost = sum(r["cost_usd"] for r in rows)
     cost_per_member = total_cost / member_count if member_count else 0.0
+
+    projections = [
+        {
+            "members": scale,
+            "weekly_usd": round(cost_per_member * scale, 4),
+            "monthly_usd": round(cost_per_member * scale * WEEKS_PER_MONTH, 4),
+        }
+        for scale in PROJECTION_MEMBER_SCALES
+    ]
 
     return {
         "members": member_count,
@@ -314,11 +335,23 @@ def summarize(rows: list[dict]) -> dict:
         "avg_input_tokens": round(total_input / member_count, 1) if member_count else 0,
         "avg_output_tokens": round(total_output / member_count, 1) if member_count else 0,
         "total_cost_usd": round(total_cost, 4),
+        # This run's own cost projected to a monthly (x4 weekly) cadence -
+        # meaningful even at a small test member_count, since it's a
+        # straight multiple of what was actually measured, not a
+        # different scale.
+        "total_cost_usd_monthly": round(total_cost * WEEKS_PER_MONTH, 4),
         "cost_per_member_usd": round(cost_per_member, 6),
-        # Projected cost of running this same batch weekly at 100 members -
-        # the scale figure the dashboard's summary cards lead with, so a
-        # 10-member test run still answers "is this affordable at scale."
+        # Projected cost of running this same batch weekly/monthly at 100
+        # members - the scale figure the dashboard's summary cards lead
+        # with, so a 10-member test run still answers "is this affordable
+        # at scale."
         "cost_per_100_members_usd": round(cost_per_member * 100, 4),
+        "cost_per_100_members_usd_monthly": round(cost_per_member * 100 * WEEKS_PER_MONTH, 4),
+        # Full 100/200/300-member weekly+monthly table, same shape as the
+        # cost-comparison email sent to management - lets this run's
+        # numbers (for whichever model is configured) be dropped straight
+        # into that same comparison.
+        "projections": projections,
         "rationale_in_range_count": sum(1 for r in rows if r["qa"]["rationale_in_range"]),
         "over_cap_count": sum(1 for r in rows if r["qa"]["over_cap"]),
         "missing_category_count": sum(1 for r in rows if r["qa"]["missing_category"]),
@@ -330,6 +363,12 @@ def summarize(rows: list[dict]) -> dict:
 # ---------------------------------------------------------------------------
 
 def save_run(mode: str, model: str, dry_run: bool, summary: dict, rows: list[dict]) -> int:
+    """Persists this run, then deletes every OTHER run — only the most
+    recent run is ever kept (its rows cascade-delete with it via
+    weekly_goal_run_rows' ON DELETE CASCADE). This is a dashboard
+    test/benchmark tool, not an audit log, so there's no need to keep
+    piling up old batches; if that ever changes, drop the DELETE below
+    and this goes back to being a full run history."""
     _ensure_ready()
     conn = psycopg.connect(DATABASE_URL)
     with conn.cursor() as cur:
@@ -341,6 +380,7 @@ def save_run(mode: str, model: str, dry_run: bool, summary: dict, rows: list[dic
             (mode, model, dry_run, summary["members"], json.dumps(summary)),
         )
         run_id = cur.fetchone()[0]
+        cur.execute("DELETE FROM weekly_goal_runs WHERE id != %s", (run_id,))
         for row in rows:
             cur.execute(
                 """
