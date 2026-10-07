@@ -1,158 +1,395 @@
 """
-Member Goal Setter — a conversational sub-agent that ASKS the member their
-fitness goal and workout frequency, then uses a deterministic rule table
-(not the LLM) to recommend their first weekly goal.
+Weekly goal batch runner (Member Goal Setter only) — generates this
+week's per-category session recommendation for N synthetic test members
+and measures the REAL token cost of doing so, so the two ways this
+agent could work can be compared on cost and on how often free-text
+model output goes out of bounds:
 
-This replaces the earlier version of this file, which expected
-fitness_goal/fitness_frequency to already be in session.state (set by some
-external caller). Per your call, this agent now collects them itself
-through conversation — "agent can ask the goal and my answers to
-questionnaire then use rules recommend weekly goal."
+  - "hybrid"   — recommend_weekly_sessions_v2() (a plain function, see
+                 member_goal_setter/weekly_session_planner_v2.py) decides
+                 the numbers deterministically, for $0 and zero LLM
+                 calls. The rationale sentence uses that file's
+                 rationale_v2() non-LLM fallback — also $0. This is the
+                 cheap, auditable path real traffic should use.
+  - "llm-only" — a single prompt asks the model to decide BOTH the
+                 per-category numbers and the rationale itself, with no
+                 code-side correction. Exists purely to measure what
+                 letting the model freelance would cost and how often
+                 its own numbers would violate a real category cap
+                 (see _qa_check) — a concrete number to point to when
+                 deciding whether "hybrid" is worth keeping, instead of
+                 just asserting it is.
 
-WHY THIS NOW NEEDS AN LLM, WHEN THE DECISION STILL DOESN'T: asking "what's
-your fitness goal?" in a chat gets free-text answers ("I wanna lose some
-weight", "get stronger I guess") — matching that to one of the exact
-questionnaire option strings (recommend_weekly_goal only understands
-"Weight loss", not "lose some weight") is a real language-understanding
-task. The RECOMMENDATION ITSELF is still a pure lookup — see
-recommend_weekly_goal() below, completely unchanged from the deterministic
-version, still independently testable with no LLM involved. The split is
-exactly the same principle as everywhere else in this project: the model's
-job stops at "figure out which exact option the member meant," then a
-plain function makes the actual decision. See
-MEMBER_GOAL_SETTER_SYSTEM_PROMPT in common/config.py for the instruction
-that enforces this — it explicitly tells the model to call the tool rather
-than invent a goal itself.
+`dry_run=True` skips the real model call entirely (for "llm-only") and
+estimates tokens from prompt length instead — lets the dashboard panel
+be exercised/tested without spending anything.
 
-WHY NO BOOKING GATE / KB / ROLLING SUMMARY, UNLIKE tribe_app/pfc/ai_coach:
-this agent's entire job is a short, bounded two-question exchange, not an
-open-ended chat that could run for a long time or touch booking — the
-machinery those agents need for long conversations and irreversible
-actions doesn't apply here. If this agent's scope grows later (e.g. it
-starts also helping book based on the goal), revisit this.
+Each run (mode, model, dry_run, per-member rows, aggregate summary) is
+persisted to Postgres so the dashboard's "SCHEDULED & SENT"-style run
+history list and per-run drill-down have something to read. Table names
+are new (weekly_goal_runs / weekly_goal_run_rows) — this is the first
+thing in this project that needs its own run history, nothing to
+collide with.
 """
 
 from __future__ import annotations
 
-from google.adk.agents import Agent
-from google.adk.agents.readonly_context import ReadonlyContext
+import json
+import logging
+import re
 
-from common.agent_config import get_system_prompt
-from common.booking_gate import make_log_usage
-from common.config import MEMBER_GOAL_SETTER_MODEL, MEMBER_GOAL_SETTER_SYSTEM_PROMPT, resolve_model
+import psycopg
+from psycopg.rows import dict_row
+
+from common.config import DATABASE_URL
+from common.kb import log_usage
+from member_goal_setter.weekly_session_planner_v2 import (
+    CATEGORY_CAPS,
+    _GOAL_TO_V2_CATEGORIES,
+    rationale_v2,
+    recommend_weekly_sessions_v2,
+)
+
+logger = logging.getLogger("reset_fitness_adk.weekly_goal_batch")
 
 AGENT_SLUG = "member-goal-setter"
 
-# ---------------------------------------------------------------------------
-# Step 1 — goal -> preferred categories, from docs/class_recommendation_rules
-# _DRAFT.md's mapping table. DRAFT: review/replace alongside that doc.
-# ---------------------------------------------------------------------------
-_GOAL_TO_CATEGORIES: dict[str, list[str]] = {
-    "Weight loss": ["Cardio", "Shape"],
-    "Lose fat (inches)": ["Cardio", "Shape"],
-    "Muscle tone": ["Shape", "Strength & Conditioning"],
-    "Build strength": ["Strength", "Strength & Conditioning"],
-    "Improve flexibility": ["Mind & Body", "Wellness"],
-    "Improve cardio performance": ["Cardio"],
-    "Improve stamina": ["Cardio", "Strength & Conditioning"],
-    "Gain weight/muscle": ["Strength", "Strength & Conditioning"],
-    "Improve overall health": ["Cardio", "Strength", "Mind & Body"],
-    "Boost energy": ["Cardio", "Bounce", "Mind & Body"],
-}
-_DEFAULT_CATEGORIES = ["Cardio", "Strength"]  # fallback for an unrecognized/missing goal
+# Capped well under anything that could run long/cost real money by
+# accident from a dashboard click — raise this deliberately, not by
+# fat-fingering a big number into the Members field.
+MAX_MEMBERS_PER_RUN = 25
+
+_GOALS = list(_GOAL_TO_V2_CATEGORIES.keys())
+_CATEGORIES = list(CATEGORY_CAPS.keys())
+
+# Same PAID-tier $/million-token figures admin.py's usage panel uses for
+# other models — gemini-3.5-flash-lite isn't in that table yet (it's $0
+# on the current free AI Studio key), so this uses gemini-2.5-flash-lite's
+# paid rate as the closest stand-in, same reasoning admin.py already
+# documents for grok-*: "what this would cost on a paid key", not what
+# today's actual bill is. Thinking tokens are billed as output tokens by
+# Gemini, so they're priced at the output rate too.
+_RATE_PER_MILLION = {"input": 0.10, "output": 0.40}
 
 # ---------------------------------------------------------------------------
-# Step 4 — frequency -> total weekly sessions, from the same doc's frequency
-# table. Picks one concrete number per answer (the doc gives ranges); for
-# "Never" we start at 1, not 0, since this is what the member is being
-# asked to aim for, not a restatement of their current habit.
+# Schema
 # ---------------------------------------------------------------------------
-_FREQUENCY_TO_SESSIONS: dict[str, int] = {
-    "1-2 times / week": 2,
-    "3-4 times / week": 3,
-    "5-6 times / week": 5,
-    "Daily": 5,  # capped below the literal "daily" ask — see safety bounds
-    "Never": 1,
-}
-_DEFAULT_SESSIONS = 2  # used when frequency is missing/unrecognized
 
-# Same hard safety bounds as docs/weekly_goal_rules_DRAFT.md's V2 rules,
-# applied here too for consistency even though V1 is much simpler.
-_MIN_TOTAL_SESSIONS = 1
-_MAX_TOTAL_SESSIONS = 6
-_MAX_PER_CATEGORY = 3
+_schema_ready = False
 
 
-def recommend_weekly_goal(fitness_goal: str, fitness_frequency: str) -> dict:
-    """Recommends a member's first weekly fitness goal from their stated
-    goal and workout frequency. Deterministic lookup — always returns the
-    same output for the same two inputs, never guesses or varies.
+def _ensure_ready() -> None:
+    global _schema_ready
+    if not _schema_ready:
+        init_weekly_goal_batch_store()
+        _schema_ready = True
 
-    Call this with the member's answers mapped to the EXACT option strings
-    from the questionnaire (e.g. "Weight loss", not "lose weight") — see
-    MEMBER_GOAL_SETTER_SYSTEM_PROMPT for the full valid lists. An
-    unrecognized string still returns a safe default rather than erroring.
 
-    Args:
-        fitness_goal: the member's goal, as one of the exact questionnaire
-            option strings (e.g. "Weight loss", "Build strength").
-        fitness_frequency: how often the member currently works out, as one
-            of the exact questionnaire option strings (e.g.
-            "3-4 times / week").
+def init_weekly_goal_batch_store() -> None:
+    conn = psycopg.connect(DATABASE_URL)
+    with conn.cursor() as cur:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS weekly_goal_runs (
+                id SERIAL PRIMARY KEY,
+                mode TEXT NOT NULL,
+                model TEXT NOT NULL,
+                dry_run BOOLEAN NOT NULL DEFAULT FALSE,
+                member_count INTEGER NOT NULL,
+                summary JSONB NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS weekly_goal_run_rows (
+                id SERIAL PRIMARY KEY,
+                run_id INTEGER NOT NULL REFERENCES weekly_goal_runs(id) ON DELETE CASCADE,
+                member_id TEXT NOT NULL,
+                goal TEXT NOT NULL,
+                category_targets JSONB NOT NULL,
+                rationale TEXT NOT NULL,
+                input_tokens INTEGER NOT NULL,
+                output_tokens INTEGER NOT NULL,
+                thinking_tokens INTEGER NOT NULL,
+                cost_usd NUMERIC NOT NULL,
+                qa JSONB NOT NULL,
+                prompt TEXT,
+                reply TEXT
+            )
+        """)
+    conn.commit()
+    conn.close()
 
-    Returns:
-        A dict with:
-          - goal_type: the goal as given (or "General fitness" if unrecognized)
-          - total_sessions_per_week: recommended total session count
-          - category_targets: dict of {category_name: sessions_per_week}
-    """
-    categories = _GOAL_TO_CATEGORIES.get(fitness_goal, _DEFAULT_CATEGORIES)
-    total = _FREQUENCY_TO_SESSIONS.get(fitness_frequency, _DEFAULT_SESSIONS)
-    total = max(_MIN_TOTAL_SESSIONS, min(_MAX_TOTAL_SESSIONS, total))
 
-    # Spread total sessions across the goal's categories round-robin, capped
-    # per category — e.g. 3 sessions across [Cardio, Shape] -> Cardio: 2,
-    # Shape: 1. Never exceeds _MAX_PER_CATEGORY even if total allows it.
-    targets = {category: 0 for category in categories}
-    remaining = total
-    i = 0
-    while remaining > 0 and any(v < _MAX_PER_CATEGORY for v in targets.values()):
-        category = categories[i % len(categories)]
-        if targets[category] < _MAX_PER_CATEGORY:
-            targets[category] += 1
-            remaining -= 1
-        i += 1
+# ---------------------------------------------------------------------------
+# Synthetic test members
+# ---------------------------------------------------------------------------
 
+def synthetic_members(count: int) -> list[dict]:
+    """Deterministic (not random) so two runs with the same count are
+    directly comparable — same goal/last-week mix every time, only the
+    model's own output can differ between runs."""
+    members = []
+    for i in range(count):
+        goal = _GOALS[i % len(_GOALS)]
+        # Spread a plausible, varied last week across the real
+        # categories without ever exceeding that category's real cap -
+        # i % 3 gives 0/1/2 which naturally clamps against every cap
+        # below (the lowest real cap is 1).
+        last_week = {cat: min((i + j) % 3, cap) for j, (cat, cap) in enumerate(CATEGORY_CAPS.items())}
+        members.append({
+            "id": f"synthetic-{i + 1:03d}",
+            "goal": goal,
+            "last_week_sessions": last_week,
+        })
+    return members
+
+
+# ---------------------------------------------------------------------------
+# QA — did the model's own numbers respect the real constraints?
+# ---------------------------------------------------------------------------
+
+def _qa_check(goal: str, category_targets: dict, rationale: str) -> dict:
+    over_cap = any(category_targets.get(cat, 0) > cap for cat, cap in CATEGORY_CAPS.items())
+    goal_categories = set(_GOAL_TO_V2_CATEGORIES.get(goal, []))
+    missing_category = bool(goal_categories) and not (goal_categories & set(category_targets.keys()))
+    word_count = len(rationale.split())
+    rationale_in_range = 30 <= word_count <= 40
     return {
-        "goal_type": fitness_goal or "General fitness",
-        "total_sessions_per_week": total - remaining if remaining else total,
-        "category_targets": {k: v for k, v in targets.items() if v > 0},
+        "over_cap": over_cap,
+        "missing_category": missing_category,
+        "rationale_word_count": word_count,
+        "rationale_in_range": rationale_in_range,
     }
 
 
-async def build_instruction(readonly_context: ReadonlyContext) -> str:
-    """Instruction provider, not a static string — matches
-    tribe_app/agent.py's pattern so this agent's persona is editable from
-    the admin dashboard's Config panel (common/agent_config.py) and takes
-    effect on the very next message, no redeploy. There's no RULES/KB/
-    rolling-summary text to append here (see this file's module
-    docstring on why this agent doesn't need that machinery) — the
-    editable persona IS the whole instruction."""
-    return get_system_prompt(AGENT_SLUG, default=MEMBER_GOAL_SETTER_SYSTEM_PROMPT)
+# ---------------------------------------------------------------------------
+# Per-member recommendation — hybrid (free) vs llm-only (real/estimated call)
+# ---------------------------------------------------------------------------
+
+def _run_hybrid_member(member: dict) -> dict:
+    result = recommend_weekly_sessions_v2(member["goal"], member["last_week_sessions"])
+    rationale = rationale_v2(member["goal"], member["last_week_sessions"], result)
+    return {
+        "category_targets": result["category_targets"],
+        "rationale": rationale,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "thinking_tokens": 0,
+        "prompt": None,
+        "reply": None,
+    }
 
 
-root_agent = Agent(
-    name="member_goal_setter",
-    model=resolve_model(MEMBER_GOAL_SETTER_MODEL),
-    instruction=build_instruction,
-    description=(
-        "Asks a member their fitness goal and workout frequency, then "
-        "recommends their first weekly goal using a deterministic rule "
-        "table (not the model's own judgment)."
-    ),
-    tools=[recommend_weekly_goal],
-    # Same usage-logging callback tribe_app/pfc use — gives this agent a
-    # row in the dashboard's Usage panel for free, no booking/KB
-    # machinery required for it to apply.
-    after_model_callback=make_log_usage(AGENT_SLUG, MEMBER_GOAL_SETTER_MODEL),
-)
+def _build_llm_prompt(member: dict) -> str:
+    return (
+        "You are recommending this week's workout session counts for a fitness studio member.\n\n"
+        f"Member's stated goal: {member['goal']}\n"
+        f"Last week's sessions per category: {json.dumps(member['last_week_sessions'])}\n"
+        f"Real weekly slot caps per category (never exceed these): {json.dumps(CATEGORY_CAPS)}\n\n"
+        "Decide this week's target session count for each category yourself, and write a short "
+        "30-40 word rationale explaining the plan to the member.\n\n"
+        "Respond with ONLY this JSON shape, no other text: "
+        '{"category_targets": {"<category>": <int>, ...}, "rationale": "<30-40 word sentence>"}'
+    )
+
+
+def _parse_llm_json(text: str) -> dict:
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if not match:
+        raise ValueError("No JSON object found in model response")
+    data = json.loads(match.group(0))
+    if "category_targets" not in data or "rationale" not in data:
+        raise ValueError("Model response missing category_targets or rationale")
+    return data
+
+
+def _run_llm_member(member: dict, model: str, dry_run: bool) -> dict:
+    prompt = _build_llm_prompt(member)
+
+    if dry_run:
+        # Stand-in, no real call: reuse the deterministic result as a
+        # plausible shape, with rough token estimates (chars / 4 is the
+        # usual ballpark for English text) purely so the UI has numbers
+        # to render while testing.
+        result = recommend_weekly_sessions_v2(member["goal"], member["last_week_sessions"])
+        rationale = rationale_v2(member["goal"], member["last_week_sessions"], result)
+        reply_text = json.dumps({"category_targets": result["category_targets"], "rationale": rationale})
+        return {
+            "category_targets": result["category_targets"],
+            "rationale": rationale,
+            "input_tokens": max(1, len(prompt) // 4),
+            "output_tokens": max(1, len(reply_text) // 4),
+            "thinking_tokens": 0,
+            "prompt": prompt,
+            "reply": reply_text,
+        }
+
+    if not (model.startswith("gemini-") or model.startswith("gemini/")):
+        raise ValueError(
+            f"Weekly goal batch's llm-only mode only supports Gemini models directly, got {model!r} — "
+            "use dry_run to test the UI, or add a non-Gemini code path first."
+        )
+    bare_model = model[len("gemini/"):] if model.startswith("gemini/") else model
+
+    from google import genai
+
+    client = genai.Client()
+    response = client.models.generate_content(model=bare_model, contents=prompt)
+    reply_text = response.text or ""
+    data = _parse_llm_json(reply_text)
+
+    usage = getattr(response, "usage_metadata", None)
+    input_tokens = getattr(usage, "prompt_token_count", None) or 0
+    output_tokens = getattr(usage, "candidates_token_count", None) or 0
+    thinking_tokens = getattr(usage, "thoughts_token_count", None) or 0
+
+    return {
+        "category_targets": data["category_targets"],
+        "rationale": data["rationale"],
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "thinking_tokens": thinking_tokens,
+        "prompt": prompt,
+        "reply": reply_text,
+    }
+
+
+def _cost_usd(input_tokens: int, output_tokens: int, thinking_tokens: int) -> float:
+    billed_output = output_tokens + thinking_tokens
+    return (input_tokens / 1_000_000 * _RATE_PER_MILLION["input"]) + (
+        billed_output / 1_000_000 * _RATE_PER_MILLION["output"]
+    )
+
+
+def run_batch(members: list[dict], mode: str, model: str, dry_run: bool = False, log_usage_rows: bool = True) -> list[dict]:
+    rows = []
+    for member in members:
+        if mode == "hybrid":
+            outcome = _run_hybrid_member(member)
+        else:
+            outcome = _run_llm_member(member, model, dry_run)
+
+        cost = _cost_usd(outcome["input_tokens"], outcome["output_tokens"], outcome["thinking_tokens"])
+        qa = _qa_check(member["goal"], outcome["category_targets"], outcome["rationale"])
+
+        if log_usage_rows and not dry_run and outcome["input_tokens"] + outcome["output_tokens"] > 0:
+            try:
+                log_usage(AGENT_SLUG, f"weekly-batch:{member['id']}", model, outcome["input_tokens"], outcome["output_tokens"])
+            except Exception:
+                logger.exception("Failed to log usage for weekly goal batch member %s", member["id"])
+
+        rows.append({
+            "member": member["id"],
+            "goal": member["goal"],
+            "category_targets": outcome["category_targets"],
+            "rationale": outcome["rationale"],
+            "input_tokens": outcome["input_tokens"],
+            "output_tokens": outcome["output_tokens"],
+            "thinking_tokens": outcome["thinking_tokens"],
+            "cost_usd": round(cost, 6),
+            "qa": qa,
+            "prompt": outcome["prompt"],
+            "reply": outcome["reply"],
+        })
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# Aggregation
+# ---------------------------------------------------------------------------
+
+def summarize(rows: list[dict]) -> dict:
+    member_count = len(rows)
+    total_input = sum(r["input_tokens"] for r in rows)
+    total_output = sum(r["output_tokens"] for r in rows)
+    total_thinking = sum(r["thinking_tokens"] for r in rows)
+    total_cost = sum(r["cost_usd"] for r in rows)
+    cost_per_member = total_cost / member_count if member_count else 0.0
+
+    return {
+        "members": member_count,
+        "total_input_tokens": total_input,
+        "total_output_tokens": total_output,
+        "total_thinking_tokens": total_thinking,
+        "avg_input_tokens": round(total_input / member_count, 1) if member_count else 0,
+        "avg_output_tokens": round(total_output / member_count, 1) if member_count else 0,
+        "total_cost_usd": round(total_cost, 4),
+        "cost_per_member_usd": round(cost_per_member, 6),
+        # Projected cost of running this same batch weekly at 100 members -
+        # the scale figure the dashboard's summary cards lead with, so a
+        # 10-member test run still answers "is this affordable at scale."
+        "cost_per_100_members_usd": round(cost_per_member * 100, 4),
+        "rationale_in_range_count": sum(1 for r in rows if r["qa"]["rationale_in_range"]),
+        "over_cap_count": sum(1 for r in rows if r["qa"]["over_cap"]),
+        "missing_category_count": sum(1 for r in rows if r["qa"]["missing_category"]),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Persistence
+# ---------------------------------------------------------------------------
+
+def save_run(mode: str, model: str, dry_run: bool, summary: dict, rows: list[dict]) -> int:
+    _ensure_ready()
+    conn = psycopg.connect(DATABASE_URL)
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO weekly_goal_runs (mode, model, dry_run, member_count, summary)
+            VALUES (%s, %s, %s, %s, %s) RETURNING id
+            """,
+            (mode, model, dry_run, summary["members"], json.dumps(summary)),
+        )
+        run_id = cur.fetchone()[0]
+        for row in rows:
+            cur.execute(
+                """
+                INSERT INTO weekly_goal_run_rows
+                    (run_id, member_id, goal, category_targets, rationale, input_tokens,
+                     output_tokens, thinking_tokens, cost_usd, qa, prompt, reply)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    run_id, row["member"], row["goal"], json.dumps(row["category_targets"]),
+                    row["rationale"], row["input_tokens"], row["output_tokens"], row["thinking_tokens"],
+                    row["cost_usd"], json.dumps(row["qa"]), row["prompt"], row["reply"],
+                ),
+            )
+    conn.commit()
+    conn.close()
+    return run_id
+
+
+def list_runs() -> list[dict]:
+    _ensure_ready()
+    conn = psycopg.connect(DATABASE_URL)
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute("""
+            SELECT id, mode, model, dry_run, member_count, summary, created_at
+            FROM weekly_goal_runs ORDER BY id DESC
+        """)
+        rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def get_run(run_id: int) -> dict | None:
+    _ensure_ready()
+    conn = psycopg.connect(DATABASE_URL)
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute("""
+            SELECT id, mode, model, dry_run, member_count, summary, created_at
+            FROM weekly_goal_runs WHERE id = %s
+        """, (run_id,))
+        run = cur.fetchone()
+        if run is None:
+            conn.close()
+            return None
+        cur.execute("""
+            SELECT member_id AS member, goal, category_targets, rationale, input_tokens,
+                   output_tokens, thinking_tokens, cost_usd, qa, prompt, reply
+            FROM weekly_goal_run_rows WHERE run_id = %s ORDER BY id
+        """, (run_id,))
+        run["rows"] = cur.fetchall()
+    conn.close()
+    return run
