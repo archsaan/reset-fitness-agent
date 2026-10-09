@@ -1,9 +1,9 @@
 """
 Weekly goal batch runner (Member Goal Setter only) — generates this
-week's per-category session recommendation for N synthetic test members
-and measures the REAL token cost of doing so, so the two ways this
-agent could work can be compared on cost and on how often free-text
-model output goes out of bounds:
+week's per-category session recommendation for the real test members in
+docs/member_wellness_preferences.xlsx and measures the REAL token cost
+of doing so, so the two ways this agent could work can be compared on
+cost and on how often free-text model output goes out of bounds:
 
   - "hybrid"   — recommend_weekly_sessions_v2() (a plain function, see
                  member_goal_setter/weekly_session_planner_v2.py) decides
@@ -37,6 +37,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from pathlib import Path
 
 import psycopg
 from psycopg.rows import dict_row
@@ -58,9 +59,6 @@ AGENT_SLUG = "member-goal-setter"
 # accident from a dashboard click — raise this deliberately, not by
 # fat-fingering a big number into the Members field.
 MAX_MEMBERS_PER_RUN = 25
-
-_GOALS = list(_GOAL_TO_V2_CATEGORIES.keys())
-_CATEGORIES = list(CATEGORY_CAPS.keys())
 
 # Same PAID-tier $/million-token figures admin.py's usage panel uses for
 # other models — gemini-3.5-flash-lite isn't in that table yet (it's $0
@@ -96,7 +94,7 @@ def init_weekly_goal_batch_store() -> None:
                 dry_run BOOLEAN NOT NULL DEFAULT FALSE,
                 member_count INTEGER NOT NULL,
                 summary JSONB NOT NULL,
-                source TEXT NOT NULL DEFAULT 'synthetic',
+                source TEXT NOT NULL DEFAULT 'workbook',
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
         """)
@@ -104,7 +102,7 @@ def init_weekly_goal_batch_store() -> None:
         # ADD COLUMN IF NOT EXISTS is a no-op on a table that already has
         # it, safe to run on every startup like the rest of this file's
         # CREATE TABLE IF NOT EXISTS statements.
-        cur.execute("ALTER TABLE weekly_goal_runs ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'synthetic'")
+        cur.execute("ALTER TABLE weekly_goal_runs ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'workbook'")
         cur.execute("""
             CREATE TABLE IF NOT EXISTS weekly_goal_run_rows (
                 id SERIAL PRIMARY KEY,
@@ -127,30 +125,6 @@ def init_weekly_goal_batch_store() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Synthetic test members
-# ---------------------------------------------------------------------------
-
-def synthetic_members(count: int) -> list[dict]:
-    """Deterministic (not random) so two runs with the same count are
-    directly comparable — same goal/last-week mix every time, only the
-    model's own output can differ between runs."""
-    members = []
-    for i in range(count):
-        goal = _GOALS[i % len(_GOALS)]
-        # Spread a plausible, varied last week across the real
-        # categories without ever exceeding that category's real cap -
-        # i % 3 gives 0/1/2 which naturally clamps against every cap
-        # below (the lowest real cap is 1).
-        last_week = {cat: min((i + j) % 3, cap) for j, (cat, cap) in enumerate(CATEGORY_CAPS.items())}
-        members.append({
-            "id": f"synthetic-{i + 1:03d}",
-            "goal": goal,
-            "last_week_sessions": last_week,
-        })
-    return members
-
-
-# ---------------------------------------------------------------------------
 # Test members sourced from docs/member_wellness_preferences.xlsx
 # ---------------------------------------------------------------------------
 
@@ -168,7 +142,12 @@ def synthetic_members(count: int) -> list[dict]:
 # assigned (from the "Member goals" tab, sourced from an actual
 # member_fitness_goals screenshot for most rows - a few are marked
 # SAMPLE in that tab for members the screenshot didn't cover).
-WORKBOOK_PATH = "docs/member_wellness_preferences.xlsx"
+# Absolute, not relative - a relative "docs/..." path only resolves
+# when the process's CWD happens to be the repo root, which isn't
+# guaranteed for every way this module gets run (uvicorn, a cron job,
+# `adk web`, ...). This file lives at <repo_root>/common/, so its own
+# parent's parent is always the repo root regardless of CWD.
+WORKBOOK_PATH = str(Path(__file__).resolve().parent.parent / "docs" / "member_wellness_preferences.xlsx")
 _PROMPT_INPUT_SHEET = "Prompt input"
 
 # Profile fields pulled from the "Prompt input" sheet, in the exact order
@@ -516,7 +495,7 @@ def summarize(rows: list[dict]) -> dict:
 # Persistence
 # ---------------------------------------------------------------------------
 
-def save_run(mode: str, model: str, dry_run: bool, summary: dict, rows: list[dict], source: str = "synthetic") -> int:
+def save_run(mode: str, model: str, dry_run: bool, summary: dict, rows: list[dict], source: str = "workbook") -> int:
     """Persists this run, then deletes every OTHER run — only the most
     recent run is ever kept (its rows cascade-delete with it via
     weekly_goal_run_rows' ON DELETE CASCADE). This is a dashboard
