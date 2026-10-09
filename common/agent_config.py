@@ -41,10 +41,18 @@ def init_agent_config_store() -> None:
         cur.execute("""
             CREATE TABLE IF NOT EXISTS agent_configs (
                 agent_slug TEXT PRIMARY KEY,
-                system_prompt TEXT NOT NULL,
+                system_prompt TEXT,
+                model TEXT,
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
         """)
+        # Migrations for a table created before `model` existed (and
+        # before system_prompt was nullable - a row can now legitimately
+        # hold a model override with no saved persona, or vice versa,
+        # so NOT NULL no longer fits). Both are no-ops once already
+        # applied, safe to run on every startup.
+        cur.execute("ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS model TEXT")
+        cur.execute("ALTER TABLE agent_configs ALTER COLUMN system_prompt DROP NOT NULL")
     conn.commit()
     conn.close()
 
@@ -61,13 +69,15 @@ def get_system_prompt(agent_slug: str, default: str) -> str:
         cur.execute("SELECT system_prompt FROM agent_configs WHERE agent_slug = %s", (agent_slug,))
         row = cur.fetchone()
     conn.close()
-    return row[0] if row else default
+    return row[0] if row and row[0] is not None else default
 
 
 def set_system_prompt(agent_slug: str, system_prompt: str) -> None:
     """Upserts the admin-edited persona prompt. An empty/whitespace-only
     string is rejected by the caller (routers/admin.py), not here —
-    kept here as a pure data-layer function."""
+    kept here as a pure data-layer function. Leaves any saved model
+    override for this agent untouched (ON CONFLICT only updates
+    system_prompt)."""
     _ensure_ready()
     conn = psycopg.connect(DATABASE_URL)
     with conn.cursor() as cur:
@@ -82,12 +92,63 @@ def set_system_prompt(agent_slug: str, system_prompt: str) -> None:
 
 
 def reset_system_prompt(agent_slug: str) -> None:
-    """Deletes any saved override, reverting the agent to its hardcoded
-    default from common/config.py. Used by the dashboard's (optional)
-    "Reset to default" action."""
+    """Reverts this agent's persona to its hardcoded default from
+    common/config.py, by clearing just the system_prompt column — NOT a
+    DELETE of the whole row, which would also wipe out any saved model
+    override for this agent (the two are independent settings sharing
+    one row)."""
     _ensure_ready()
     conn = psycopg.connect(DATABASE_URL)
     with conn.cursor() as cur:
-        cur.execute("DELETE FROM agent_configs WHERE agent_slug = %s", (agent_slug,))
+        cur.execute(
+            "UPDATE agent_configs SET system_prompt = NULL, updated_at = NOW() WHERE agent_slug = %s",
+            (agent_slug,),
+        )
+    conn.commit()
+    conn.close()
+
+
+def get_agent_model(agent_slug: str, default: str) -> str:
+    """Returns the admin-chosen model override for this agent, or
+    `default` (the env-configured MEMBER_GOAL_SETTER_MODEL etc.) if
+    nobody has saved one. Same freshness guarantee as
+    get_system_prompt(): callers should re-check this rather than cache
+    it, so a switch takes effect without a redeploy."""
+    _ensure_ready()
+    conn = psycopg.connect(DATABASE_URL)
+    with conn.cursor() as cur:
+        cur.execute("SELECT model FROM agent_configs WHERE agent_slug = %s", (agent_slug,))
+        row = cur.fetchone()
+    conn.close()
+    return row[0] if row and row[0] is not None else default
+
+
+def set_agent_model(agent_slug: str, model: str) -> None:
+    """Upserts the admin-chosen model override. Leaves any saved
+    system_prompt for this agent untouched."""
+    _ensure_ready()
+    conn = psycopg.connect(DATABASE_URL)
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO agent_configs (agent_slug, model, updated_at)
+            VALUES (%s, %s, NOW())
+            ON CONFLICT (agent_slug) DO UPDATE
+                SET model = EXCLUDED.model, updated_at = NOW()
+        """, (agent_slug, model))
+    conn.commit()
+    conn.close()
+
+
+def reset_agent_model(agent_slug: str) -> None:
+    """Reverts this agent's model to its env-configured default by
+    clearing just the model column (same leave-the-row,
+    clear-one-column approach as reset_system_prompt)."""
+    _ensure_ready()
+    conn = psycopg.connect(DATABASE_URL)
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE agent_configs SET model = NULL, updated_at = NOW() WHERE agent_slug = %s",
+            (agent_slug,),
+        )
     conn.commit()
     conn.close()

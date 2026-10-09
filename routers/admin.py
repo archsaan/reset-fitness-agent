@@ -17,12 +17,16 @@ So this router implements:
   - GET    /admin/agents/{agent_slug}/usage                     (per-agent usage summary)
   - GET    /admin/agents/{agent_slug}/session-stats              (longest real conversations, diagnostics only)
   - POST   /admin/agents/{agent_slug}/test-chat                 (throwaway ADK session, real reply)
+  - PUT    /admin/agents/{agent_slug}/model                     (member-goal-setter ONLY — see below)
+  - DELETE /admin/agents/{agent_slug}/model                     (member-goal-setter ONLY — see below)
 
 NOT implemented on purpose: POST/DELETE /admin/agents (create/delete —
 manage by adding/removing agent folders and redeploying) and changing
-`model` via PUT (still env/code-controlled — see common/config.py's
-resolve_model, switching models has real cost/quota implications so
-it's deliberately not a one-click dashboard action).
+`model` for tribe-app/pfc via PUT /admin/agents/{agent_slug} (still
+env/code-controlled for those two — see common/config.py's
+resolve_model; switching models for an agent that can execute real
+bookings has real cost/quota AND safety-review implications, so it's
+deliberately not a one-click dashboard action there).
 
 PUT /admin/agents/{agent_slug} DOES work now, for system_prompt only:
 it's stored in Postgres (common/agent_config.py, agent_configs table)
@@ -34,6 +38,17 @@ text (never guess a calendar_schedule_id, only book after
 check_availability, etc.) stays hardcoded in common/config.py and is
 always appended after whatever persona is active, so this endpoint can
 never be used to weaken the booking gate.
+
+PUT/DELETE /admin/agents/{agent_slug}/model — a DELIBERATE, NARROWER
+exception to the "model isn't dashboard-switchable" rule above, scoped
+to member-goal-setter only (404s for every other agent_slug, same
+gating as the weekly-goals routes below): this agent has no booking
+gate, no real-money action, no safety review to bypass - its entire job
+is a short bounded Q&A, so letting it try a different Gemini model from
+the dashboard is low-risk in a way it explicitly isn't for tribe-app/
+pfc. Takes effect on a member's NEXT message, not instantly (see
+routers/live.py's module docstring on why a model switch can't apply
+mid-conversation the way a system_prompt edit can).
 """
 
 import logging
@@ -42,7 +57,14 @@ import uuid
 from fastapi import APIRouter, File, Header, HTTPException, UploadFile
 from google.genai import types
 
-from common.agent_config import get_system_prompt, reset_system_prompt, set_system_prompt
+from common.agent_config import (
+    get_agent_model,
+    get_system_prompt,
+    reset_agent_model,
+    reset_system_prompt,
+    set_agent_model,
+    set_system_prompt,
+)
 from common.config import (
     MEMBER_GOAL_SETTER_MODEL,
     MEMBER_GOAL_SETTER_SYSTEM_PROMPT,
@@ -153,8 +175,14 @@ def _root_agent_for(agent_slug: str):
         from ai_coach.agent import root_agent
         return root_agent
     if agent_slug == "member-goal-setter":
-        from member_goal_setter.agent import root_agent
-        return root_agent
+        # Built fresh with whatever model is currently configured
+        # (override if the dashboard's model switcher has saved one,
+        # the env default otherwise) - NOT the static root_agent import,
+        # so Test Chat actually exercises the model the switcher claims
+        # to have set, not whatever was baked in at process startup.
+        from member_goal_setter.agent import AGENT_SLUG, build_agent
+        model = get_agent_model(AGENT_SLUG, default=MEMBER_GOAL_SETTER_MODEL)
+        return build_agent(model)
     raise HTTPException(status_code=404, detail="Agent not found")
 
 
@@ -177,6 +205,12 @@ def get_agent_route(agent_slug: str, authorization: str = Header(None)):
         # can't be edited through this endpoint. See the module
         # docstring for the reasoning.
         "system_prompt": get_system_prompt(agent_slug, default=_DEFAULT_PROMPTS[agent_slug]),
+        # Overrides agent["active_model"] with the dashboard-saved model
+        # override when one exists - a no-op (returns agent["active_model"]
+        # itself) for every agent except member-goal-setter, since only
+        # that one can ever have a row to find. See this module's
+        # docstring for why model switching is scoped to that one agent.
+        "active_model": get_agent_model(agent_slug, default=agent["active_model"]),
     }
 
 
@@ -221,6 +255,55 @@ def reset_agent_prompt_route(agent_slug: str, authorization: str = Header(None))
         logger.exception("Failed to reset system_prompt for agent %s", agent_slug)
         raise HTTPException(status_code=500, detail="Failed to reset system prompt")
     return {"status": "reset", "system_prompt": _DEFAULT_PROMPTS[agent_slug]}
+
+
+# ---------------------------------------------------------
+# Model switcher — member-goal-setter ONLY. See this module's docstring
+# for why this is a deliberate exception to "model isn't a dashboard
+# control" (true for tribe-app/pfc), and routers/live.py's docstring for
+# how a saved override actually reaches real traffic.
+# ---------------------------------------------------------
+
+_MODEL_SWITCHABLE_AGENT = "member-goal-setter"
+
+
+@router.put("/agents/{agent_slug}/model")
+def update_agent_model_route(agent_slug: str, payload: dict, authorization: str = Header(None)):
+    """Body: {"model": "gemini-3.8-flash"}. Takes effect on this agent's
+    next message (both real traffic via routers/live.py, and Test Chat
+    here) — not instantly, not mid-conversation. See this module's
+    docstring for why this exists only for member-goal-setter."""
+    _require_admin(authorization)
+    if agent_slug != _MODEL_SWITCHABLE_AGENT:
+        raise HTTPException(status_code=404, detail="Model switching is only available for member-goal-setter")
+    model = (payload.get("model") or "").strip()
+    if not model:
+        raise HTTPException(status_code=400, detail="model is required")
+    if not (model.startswith("gemini-") or model.startswith("gemini/")):
+        raise HTTPException(status_code=400, detail="model must be a Gemini model (e.g. gemini-3.8-flash)")
+
+    try:
+        set_agent_model(agent_slug, model)
+    except Exception:
+        logger.exception("Failed to save model override for agent %s", agent_slug)
+        raise HTTPException(status_code=500, detail="Failed to save model")
+
+    return {"status": "updated", "model": model}
+
+
+@router.delete("/agents/{agent_slug}/model")
+def reset_agent_model_route(agent_slug: str, authorization: str = Header(None)):
+    """Reverts this agent to its env-configured MEMBER_GOAL_SETTER_MODEL,
+    discarding any dashboard-saved override."""
+    _require_admin(authorization)
+    if agent_slug != _MODEL_SWITCHABLE_AGENT:
+        raise HTTPException(status_code=404, detail="Model switching is only available for member-goal-setter")
+    try:
+        reset_agent_model(agent_slug)
+    except Exception:
+        logger.exception("Failed to reset model override for agent %s", agent_slug)
+        raise HTTPException(status_code=500, detail="Failed to reset model")
+    return {"status": "reset", "model": MEMBER_GOAL_SETTER_MODEL}
 
 
 # ---------------------------------------------------------
@@ -470,11 +553,18 @@ _test_sessions_created: set = set()
 
 
 def _get_test_runner(agent_slug: str):
-    if agent_slug not in _test_runners:
+    # member-goal-setter's _root_agent_for() builds a fresh Agent from
+    # whatever model is CURRENTLY configured - cache key has to include
+    # that model, or switching models and testing again would just keep
+    # returning the stale, pre-switch runner.
+    cache_key = agent_slug
+    if agent_slug == "member-goal-setter":
+        cache_key = f"{agent_slug}:{get_agent_model(agent_slug, default=MEMBER_GOAL_SETTER_MODEL)}"
+    if cache_key not in _test_runners:
         from google.adk.runners import InMemoryRunner
         root_agent = _root_agent_for(agent_slug)
-        _test_runners[agent_slug] = InMemoryRunner(agent=root_agent, app_name=f"{agent_slug}-admin-test")
-    return _test_runners[agent_slug]
+        _test_runners[cache_key] = InMemoryRunner(agent=root_agent, app_name=f"{agent_slug}-admin-test")
+    return _test_runners[cache_key]
 
 
 @router.post("/agents/{agent_slug}/test-chat")

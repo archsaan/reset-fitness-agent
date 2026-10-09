@@ -23,6 +23,19 @@ it starts also helping book, like tribe_app/pfc), revisit this - that's
 exactly the kind of agent that DOES need the shared session service, and
 the right fix then is removing it from the exclusion set in main.py, not
 extending this in-memory approach.
+
+MODEL SWITCHING: the dashboard's Config panel can save a model override
+for this agent (common/agent_config.py's set_agent_model). ADK's
+Agent.model is fixed at construction, so there's no way to make one
+cached runner "notice" that the way build_instruction already notices a
+system_prompt change every turn - instead, _get_runner() below rebuilds
+(member_goal_setter.agent.build_agent + a fresh InMemoryRunner) whenever
+the currently-configured model differs from whichever one the cached
+runner was built for. A switch therefore takes effect on a member's
+NEXT message, not mid-exchange - an in-progress 2-question conversation
+finishes on whatever model it started with, since swapping the runner
+out from under an open session would just lose that session's state
+anyway (see the in-memory-only tradeoff above).
 """
 
 import logging
@@ -32,15 +45,30 @@ from fastapi import APIRouter, HTTPException
 from google.adk.runners import InMemoryRunner
 from google.genai import types
 
-from member_goal_setter.agent import root_agent
+from common.agent_config import get_agent_model
+from common.config import MEMBER_GOAL_SETTER_MODEL
+from member_goal_setter.agent import AGENT_SLUG, build_agent
 
 logger = logging.getLogger("reset_fitness_adk.live")
 
 router = APIRouter(prefix="/live", tags=["live"])
 
 APP_NAME = "member_goal_setter-live"
-_runner = InMemoryRunner(agent=root_agent, app_name=APP_NAME)
-_sessions_created: set[str] = set()
+
+# One runner + session-created set per model string actually used so
+# far - switching back to a previously-used model reuses its runner
+# (and whatever in-memory sessions it still has) rather than rebuilding
+# from scratch every time.
+_runners: dict[str, InMemoryRunner] = {}
+_sessions_created: dict[str, set[str]] = {}
+
+
+def _get_runner() -> tuple[InMemoryRunner, str]:
+    model = get_agent_model(AGENT_SLUG, default=MEMBER_GOAL_SETTER_MODEL)
+    if model not in _runners:
+        _runners[model] = InMemoryRunner(agent=build_agent(model), app_name=APP_NAME)
+        _sessions_created[model] = set()
+    return _runners[model], model
 
 
 @router.post("/member-goal-setter/chat")
@@ -56,12 +84,13 @@ async def member_goal_setter_chat(payload: dict):
     session_id = payload.get("session_id") or f"live:{uuid.uuid4()}"
     user_id = payload.get("user_id") or "member"
 
-    if session_id not in _sessions_created:
-        await _runner.session_service.create_session(app_name=APP_NAME, user_id=user_id, session_id=session_id)
-        _sessions_created.add(session_id)
+    runner, model = _get_runner()
+    if session_id not in _sessions_created[model]:
+        await runner.session_service.create_session(app_name=APP_NAME, user_id=user_id, session_id=session_id)
+        _sessions_created[model].add(session_id)
 
     reply_text = ""
-    async for event in _runner.run_async(
+    async for event in runner.run_async(
         user_id=user_id,
         session_id=session_id,
         new_message=types.Content(role="user", parts=[types.Part(text=message)]),

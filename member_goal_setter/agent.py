@@ -141,18 +141,39 @@ async def build_instruction(readonly_context: ReadonlyContext) -> str:
     return get_system_prompt(AGENT_SLUG, default=MEMBER_GOAL_SETTER_SYSTEM_PROMPT)
 
 
-root_agent = Agent(
-    name="member_goal_setter",
-    model=resolve_model(MEMBER_GOAL_SETTER_MODEL),
-    instruction=build_instruction,
-    description=(
-        "Asks a member their fitness goal and workout frequency, then "
-        "recommends their first weekly goal using a deterministic rule "
-        "table (not the model's own judgment)."
-    ),
-    tools=[recommend_weekly_goal],
-    # Same usage-logging callback tribe_app/pfc use — gives this agent a
-    # row in the dashboard's Usage panel for free, no booking/KB
-    # machinery required for it to apply.
-    after_model_callback=make_log_usage(AGENT_SLUG, MEMBER_GOAL_SETTER_MODEL),
-)
+def build_agent(model_name: str | None = None) -> Agent:
+    """Factory, not just a module-level constant — ADK's Agent.model is
+    fixed at construction (a plain str/BaseLlm, unlike `instruction`
+    which accepts a callable re-evaluated every turn), so there's no way
+    to make one Agent instance "notice" a model change the way it
+    already notices a system_prompt change. The admin dashboard's model
+    switcher (common/agent_config.py's get_agent_model/set_agent_model)
+    works around that by building a FRESH Agent (and a fresh runner —
+    see routers/live.py) whenever the configured model differs from the
+    cached one, rather than mutating an existing Agent in place.
+
+    model_name defaults to the env-configured MEMBER_GOAL_SETTER_MODEL
+    when not given, so root_agent below (used by anything that doesn't
+    care about the switcher) keeps its original behavior."""
+    model_name = model_name or MEMBER_GOAL_SETTER_MODEL
+    return Agent(
+        name="member_goal_setter",
+        model=resolve_model(model_name),
+        instruction=build_instruction,
+        description=(
+            "Asks a member their fitness goal and workout frequency, then "
+            "recommends their first weekly goal using a deterministic rule "
+            "table (not the model's own judgment)."
+        ),
+        tools=[recommend_weekly_goal],
+        # Same usage-logging callback tribe_app/pfc use — gives this agent a
+        # row in the dashboard's Usage panel for free, no booking/KB
+        # machinery required for it to apply. Passed the ACTUAL model this
+        # instance uses (not always MEMBER_GOAL_SETTER_MODEL), so usage
+        # logs correctly attribute cost to whichever model is really
+        # answering, including a dashboard-switched one.
+        after_model_callback=make_log_usage(AGENT_SLUG, model_name),
+    )
+
+
+root_agent = build_agent()
