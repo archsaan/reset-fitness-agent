@@ -41,8 +41,7 @@ import re
 import psycopg
 from psycopg.rows import dict_row
 
-from common.agent_config import get_system_prompt
-from common.config import DATABASE_URL, MEMBER_GOAL_SETTER_SYSTEM_PROMPT
+from common.config import DATABASE_URL
 from common.kb import log_usage
 from member_goal_setter.weekly_session_planner_v2 import (
     CATEGORY_CAPS,
@@ -500,6 +499,13 @@ def summarize(rows: list[dict]) -> dict:
         # numbers (for whichever model is configured) be dropped straight
         # into that same comparison.
         "projections": projections,
+        # rationale_in_range is None (not False) on a row with no
+        # rationale at all (the workbook's llm-only prompt never asks
+        # for one) - rationale_checked_count is the real denominator for
+        # rationale_in_range_count, so the dashboard can show "X/Y
+        # checked" instead of implying every member failed a check that
+        # was never applicable to them.
+        "rationale_checked_count": sum(1 for r in rows if r["qa"]["rationale_in_range"] is not None),
         "rationale_in_range_count": sum(1 for r in rows if r["qa"]["rationale_in_range"]),
         "over_cap_count": sum(1 for r in rows if r["qa"]["over_cap"]),
         "missing_category_count": sum(1 for r in rows if r["qa"]["missing_category"]),
