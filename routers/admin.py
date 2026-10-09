@@ -357,15 +357,19 @@ _BATCH_AGENT = "member-goal-setter"
 
 @router.post("/agents/{agent_slug}/weekly-goals/run")
 def run_weekly_goal_batch(agent_slug: str, payload: dict, authorization: str = Header(None)):
-    """Body: {"count": 10, "mode": "hybrid" | "llm-only", "dry_run": false}.
-    Runs synchronously (about 1-3 seconds per member), stores the run and
-    returns it. `count` is capped to protect against an accidental big
-    spend; `dry_run` uses a stand-in model with estimated tokens, for UI
-    testing. Test members always come from
-    docs/member_wellness_preferences.xlsx - their goal is the member's
-    real first-pick goal (see that workbook's "Member goals" tab),
-    Test-ID-only, never a real name; `count` caps how many of its rows
-    are used."""
+    """Body: {"count": 10, "mode": "hybrid" | "llm-only", "dry_run": false,
+    "model": "gemini-3.5-flash-lite"}. Runs synchronously (about 1-3
+    seconds per member), stores the run and returns it. `count` is
+    capped to protect against an accidental big spend; `dry_run` uses a
+    stand-in model with estimated tokens, for UI testing. Test members
+    always come from docs/member_wellness_preferences.xlsx - their goal
+    is the member's real first-pick goal (see that workbook's "Member
+    goals" tab), Test-ID-only, never a real name; `count` caps how many
+    of its rows are used. `model` lets a run try a different Gemini
+    model than the agent's configured MEMBER_GOAL_SETTER_MODEL - this
+    only affects THIS batch run, never the live deployed agent, which
+    always uses the env-configured model regardless of what's tried
+    here."""
     from common import weekly_goal_batch  # lazy: a missing file must not stop the app starting
     _require_admin(authorization)
     if agent_slug != _BATCH_AGENT:
@@ -384,7 +388,9 @@ def run_weekly_goal_batch(agent_slug: str, payload: dict, authorization: str = H
             detail=f"count must be between 1 and {weekly_goal_batch.MAX_MEMBERS_PER_RUN}",
         )
     dry_run = bool(payload.get("dry_run", False))
-    model = MEMBER_GOAL_SETTER_MODEL
+    model = (payload.get("model") or MEMBER_GOAL_SETTER_MODEL).strip()
+    if not (model.startswith("gemini-") or model.startswith("gemini/")):
+        raise HTTPException(status_code=400, detail="model must be a Gemini model (e.g. gemini-3.5-flash-lite)")
 
     try:
         members = weekly_goal_batch.workbook_members(limit=count)

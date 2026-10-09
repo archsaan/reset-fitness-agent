@@ -23,6 +23,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--count", type=int, default=10, help="Max number of test members")
     parser.add_argument("--mode", choices=["hybrid", "llm-only"], default="hybrid")
+    parser.add_argument(
+        "--model", default=MEMBER_GOAL_SETTER_MODEL,
+        help="Gemini model to try for llm-only mode (default: the agent's configured "
+             f"MEMBER_GOAL_SETTER_MODEL, currently {MEMBER_GOAL_SETTER_MODEL!r}) - this only "
+             "affects this batch run, never the live deployed agent.",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Estimate tokens instead of calling the model")
     parser.add_argument("--save", action="store_true", help="Persist this run (same as the dashboard's Run batch)")
     args = parser.parse_args()
@@ -35,14 +41,14 @@ def main() -> None:
         parser.error(f"No usable rows found in {weekly_goal_batch.WORKBOOK_PATH}")
 
     rows = weekly_goal_batch.run_batch(
-        members, args.mode, MEMBER_GOAL_SETTER_MODEL, dry_run=args.dry_run, log_usage_rows=args.save
+        members, args.mode, args.model, dry_run=args.dry_run, log_usage_rows=args.save
     )
     summary = weekly_goal_batch.summarize(rows)
 
     print(json.dumps({"summary": summary, "rows": rows}, indent=2, default=str))
 
     if args.save:
-        run_id = weekly_goal_batch.save_run(args.mode, MEMBER_GOAL_SETTER_MODEL, args.dry_run, summary, rows)
+        run_id = weekly_goal_batch.save_run(args.mode, args.model, args.dry_run, summary, rows)
         print(f"\nSaved as run #{run_id}")
 
 

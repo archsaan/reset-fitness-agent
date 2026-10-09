@@ -60,14 +60,32 @@ AGENT_SLUG = "member-goal-setter"
 # fat-fingering a big number into the Members field.
 MAX_MEMBERS_PER_RUN = 25
 
-# Same PAID-tier $/million-token figures admin.py's usage panel uses for
-# other models — gemini-3.5-flash-lite isn't in that table yet (it's $0
-# on the current free AI Studio key), so this uses gemini-2.5-flash-lite's
-# paid rate as the closest stand-in, same reasoning admin.py already
-# documents for grok-*: "what this would cost on a paid key", not what
-# today's actual bill is. Thinking tokens are billed as output tokens by
-# Gemini, so they're priced at the output rate too.
-_RATE_PER_MILLION = {"input": 0.10, "output": 0.40}
+# PAID-tier $/million-token figures, same reasoning as admin.py's usage
+# panel: Gemini via AI Studio's free tier is $0, so these are "what this
+# would cost on a paid key," not today's actual bill. Thinking tokens
+# are billed as output tokens by Gemini, so they're priced at the output
+# rate too. Keyed by bare model name so a batch run can compare models
+# (e.g. "try gemini-3.8-flash") on real cost, not just token count -
+# _DEFAULT_RATE_PER_MILLION covers any model not listed here yet (check
+# https://ai.google.dev/pricing and add it rather than trust the
+# fallback for a real comparison).
+_RATE_PER_MILLION_BY_MODEL = {
+    "gemini-2.5-flash": {"input": 0.30, "output": 2.50},
+    "gemini-2.5-flash-lite": {"input": 0.10, "output": 0.40},
+    "gemini-2.0-flash": {"input": 0.10, "output": 0.40},
+    # Not priced on ai.google.dev yet as of this writing - using
+    # 2.5-flash-lite's rate as the closest stand-in until Google
+    # publishes real figures for these.
+    "gemini-3.5-flash-lite": {"input": 0.10, "output": 0.40},
+    "gemini-3.6-flash": {"input": 0.30, "output": 2.50},
+    "gemini-3.8-flash": {"input": 0.30, "output": 2.50},
+}
+_DEFAULT_RATE_PER_MILLION = {"input": 0.10, "output": 0.40}
+
+
+def _rate_for_model(model: str) -> dict:
+    bare_model = model[len("gemini/"):] if model.startswith("gemini/") else model
+    return _RATE_PER_MILLION_BY_MODEL.get(bare_model, _DEFAULT_RATE_PER_MILLION)
 
 # ---------------------------------------------------------------------------
 # Schema
@@ -117,9 +135,11 @@ def init_weekly_goal_batch_store() -> None:
                 cost_usd NUMERIC NOT NULL,
                 qa JSONB NOT NULL,
                 prompt TEXT,
-                reply TEXT
+                reply TEXT,
+                error TEXT
             )
         """)
+        cur.execute("ALTER TABLE weekly_goal_run_rows ADD COLUMN IF NOT EXISTS error TEXT")
     conn.commit()
     conn.close()
 
@@ -380,22 +400,36 @@ def _run_llm_member(member: dict, model: str, dry_run: bool) -> dict:
     }
 
 
-def _cost_usd(input_tokens: int, output_tokens: int, thinking_tokens: int) -> float:
+def _cost_usd(input_tokens: int, output_tokens: int, thinking_tokens: int, model: str) -> float:
+    rate = _rate_for_model(model)
     billed_output = output_tokens + thinking_tokens
-    return (input_tokens / 1_000_000 * _RATE_PER_MILLION["input"]) + (
-        billed_output / 1_000_000 * _RATE_PER_MILLION["output"]
-    )
+    return (input_tokens / 1_000_000 * rate["input"]) + (billed_output / 1_000_000 * rate["output"])
 
 
 def run_batch(members: list[dict], mode: str, model: str, dry_run: bool = False, log_usage_rows: bool = True) -> list[dict]:
     rows = []
     for member in members:
-        if mode == "hybrid":
-            outcome = _run_hybrid_member(member)
-        else:
-            outcome = _run_llm_member(member, model, dry_run)
+        try:
+            if mode == "hybrid":
+                outcome = _run_hybrid_member(member)
+            else:
+                outcome = _run_llm_member(member, model, dry_run)
+            error = None
+        except Exception as exc:
+            # A single member's call failing (rate limit, transient 503,
+            # a malformed JSON reply, ...) must not lose every OTHER
+            # member's already-computed results - this run has real
+            # token cost sunk into it even for a mid-batch failure, and
+            # an all-or-nothing run would silently waste that whenever
+            # one Gemini call has a bad moment.
+            logger.exception("weekly goal batch: member %s failed", member["id"])
+            outcome = {
+                "category_targets": {}, "rationale": "", "input_tokens": 0,
+                "output_tokens": 0, "thinking_tokens": 0, "prompt": None, "reply": None,
+            }
+            error = str(exc)
 
-        cost = _cost_usd(outcome["input_tokens"], outcome["output_tokens"], outcome["thinking_tokens"])
+        cost = _cost_usd(outcome["input_tokens"], outcome["output_tokens"], outcome["thinking_tokens"], model)
         qa = _qa_check(member["goal"], outcome["category_targets"], outcome["rationale"])
 
         if log_usage_rows and not dry_run and outcome["input_tokens"] + outcome["output_tokens"] > 0:
@@ -416,6 +450,7 @@ def run_batch(members: list[dict], mode: str, model: str, dry_run: bool = False,
             "qa": qa,
             "prompt": outcome["prompt"],
             "reply": outcome["reply"],
+            "error": error,
         })
     return rows
 
@@ -488,6 +523,7 @@ def summarize(rows: list[dict]) -> dict:
         "rationale_in_range_count": sum(1 for r in rows if r["qa"]["rationale_in_range"]),
         "over_cap_count": sum(1 for r in rows if r["qa"]["over_cap"]),
         "missing_category_count": sum(1 for r in rows if r["qa"]["missing_category"]),
+        "error_count": sum(1 for r in rows if r.get("error")),
     }
 
 
@@ -519,13 +555,13 @@ def save_run(mode: str, model: str, dry_run: bool, summary: dict, rows: list[dic
                 """
                 INSERT INTO weekly_goal_run_rows
                     (run_id, member_id, goal, category_targets, rationale, input_tokens,
-                     output_tokens, thinking_tokens, cost_usd, qa, prompt, reply)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                     output_tokens, thinking_tokens, cost_usd, qa, prompt, reply, error)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     run_id, row["member"], row["goal"], json.dumps(row["category_targets"]),
                     row["rationale"], row["input_tokens"], row["output_tokens"], row["thinking_tokens"],
-                    row["cost_usd"], json.dumps(row["qa"]), row["prompt"], row["reply"],
+                    row["cost_usd"], json.dumps(row["qa"]), row["prompt"], row["reply"], row.get("error"),
                 ),
             )
     conn.commit()
@@ -560,7 +596,7 @@ def get_run(run_id: int) -> dict | None:
             return None
         cur.execute("""
             SELECT member_id AS member, goal, category_targets, rationale, input_tokens,
-                   output_tokens, thinking_tokens, cost_usd, qa, prompt, reply
+                   output_tokens, thinking_tokens, cost_usd, qa, prompt, reply, error
             FROM weekly_goal_run_rows WHERE run_id = %s ORDER BY id
         """, (run_id,))
         run["rows"] = cur.fetchall()
