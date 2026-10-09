@@ -8,3 +8,4 @@ voyageai
 python-dotenv
 python-multipart
 sqlalchemy
+openpyxl

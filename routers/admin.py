@@ -357,10 +357,17 @@ _BATCH_AGENT = "member-goal-setter"
 
 @router.post("/agents/{agent_slug}/weekly-goals/run")
 def run_weekly_goal_batch(agent_slug: str, payload: dict, authorization: str = Header(None)):
-    """Body: {"count": 10, "mode": "hybrid" | "llm-only", "dry_run": false}.
-    Runs synchronously (about 1-3 seconds per member), stores the run and
-    returns it. `count` is capped to protect against an accidental big spend;
-    `dry_run` uses a stand-in model with estimated tokens, for UI testing."""
+    """Body: {"count": 10, "mode": "hybrid" | "llm-only", "dry_run": false,
+    "source": "workbook" | "synthetic"}. Runs synchronously (about 1-3
+    seconds per member), stores the run and returns it. `count` is capped
+    to protect against an accidental big spend; `dry_run` uses a stand-in
+    model with estimated tokens, for UI testing. `source: "workbook"`
+    (the default) pulls test members from
+    docs/member_wellness_preferences.xlsx - their goal is the member's
+    real first-pick goal (see that workbook's "Member goals" tab),
+    Test-ID-only, never a real name; `count` then just caps how many of
+    its rows are used. `source: "synthetic"` falls back to the older
+    fully made-up synthetic_members() generator."""
     from common import weekly_goal_batch  # lazy: a missing file must not stop the app starting
     _require_admin(authorization)
     if agent_slug != _BATCH_AGENT:
@@ -369,6 +376,9 @@ def run_weekly_goal_batch(agent_slug: str, payload: dict, authorization: str = H
     mode = payload.get("mode", "hybrid")
     if mode not in ("hybrid", "llm-only"):
         raise HTTPException(status_code=400, detail="mode must be 'hybrid' or 'llm-only'")
+    source = payload.get("source", "workbook")
+    if source not in ("workbook", "synthetic"):
+        raise HTTPException(status_code=400, detail="source must be 'workbook' or 'synthetic'")
     try:
         count = int(payload.get("count", 10))
     except (TypeError, ValueError):
@@ -381,17 +391,28 @@ def run_weekly_goal_batch(agent_slug: str, payload: dict, authorization: str = H
     dry_run = bool(payload.get("dry_run", False))
     model = MEMBER_GOAL_SETTER_MODEL
 
-    members = weekly_goal_batch.synthetic_members(count)
+    if source == "workbook":
+        try:
+            members = weekly_goal_batch.workbook_members(limit=count)
+        except FileNotFoundError:
+            raise HTTPException(
+                status_code=404,
+                detail=f"{weekly_goal_batch.WORKBOOK_PATH} not found - use source='synthetic', or add the workbook.",
+            )
+        if not members:
+            raise HTTPException(status_code=500, detail="Workbook has no usable test member rows")
+    else:
+        members = weekly_goal_batch.synthetic_members(count)
     rows = weekly_goal_batch.run_batch(members, mode, model, dry_run=dry_run, log_usage_rows=True)
     summary = weekly_goal_batch.summarize(rows)
 
     try:
-        run_id = weekly_goal_batch.save_run(mode, model, dry_run, summary, rows)
+        run_id = weekly_goal_batch.save_run(mode, model, dry_run, summary, rows, source=source)
     except Exception:
         logger.exception("Failed to save weekly goal run")
         raise HTTPException(status_code=500, detail="Batch ran but saving the result failed")
 
-    return {"id": run_id, "mode": mode, "model": model, "dry_run": dry_run,
+    return {"id": run_id, "mode": mode, "model": model, "dry_run": dry_run, "source": source,
             "member_count": summary["members"], "summary": summary, "rows": rows}
 
 

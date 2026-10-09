@@ -33,8 +33,18 @@ from google.adk.cli.fast_api import get_fast_api_app
 
 from common.agent_config import init_agent_config_store
 from common.config import ADK_SESSION_DB_URL, DATABASE_URL
+from common.excluding_agent_loader import ExcludingAgentLoader
 from common.kb import init_kb_store
 from routers.admin import router as admin_router
+from routers.live import router as live_router
+
+# Agents kept OUT of get_fast_api_app()'s shared, Postgres-backed
+# session service - each one needs its own router.py giving it a
+# different (in this case in-memory-only) way to be reached in
+# production. See routers/live.py's module docstring for why
+# member-goal-setter is here: real conversations for it aren't persisted
+# yet, by explicit choice going into launch.
+EXCLUDED_FROM_SHARED_SESSION_SERVICE = {"member_goal_setter"}
 
 # Structured-ish logging to stdout. Render (and most hosts) capture
 # stdout directly into their log viewer, so this is the whole
@@ -52,12 +62,14 @@ init_agent_config_store()
 
 app: FastAPI = get_fast_api_app(
     agents_dir=".",
+    agent_loader=ExcludingAgentLoader(".", EXCLUDED_FROM_SHARED_SESSION_SERVICE),
     session_service_uri=ADK_SESSION_DB_URL,
     allow_origins=["*"],
     web=True,
 )
 
 app.include_router(admin_router)
+app.include_router(live_router)
 
 
 @app.get("/")

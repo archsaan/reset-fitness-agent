@@ -41,7 +41,8 @@ import re
 import psycopg
 from psycopg.rows import dict_row
 
-from common.config import DATABASE_URL
+from common.agent_config import get_system_prompt
+from common.config import DATABASE_URL, MEMBER_GOAL_SETTER_SYSTEM_PROMPT
 from common.kb import log_usage
 from member_goal_setter.weekly_session_planner_v2 import (
     CATEGORY_CAPS,
@@ -96,9 +97,15 @@ def init_weekly_goal_batch_store() -> None:
                 dry_run BOOLEAN NOT NULL DEFAULT FALSE,
                 member_count INTEGER NOT NULL,
                 summary JSONB NOT NULL,
+                source TEXT NOT NULL DEFAULT 'synthetic',
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
         """)
+        # One-time migration for a table created before `source` existed -
+        # ADD COLUMN IF NOT EXISTS is a no-op on a table that already has
+        # it, safe to run on every startup like the rest of this file's
+        # CREATE TABLE IF NOT EXISTS statements.
+        cur.execute("ALTER TABLE weekly_goal_runs ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'synthetic'")
         cur.execute("""
             CREATE TABLE IF NOT EXISTS weekly_goal_run_rows (
                 id SERIAL PRIMARY KEY,
@@ -145,6 +152,143 @@ def synthetic_members(count: int) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Test members sourced from docs/member_wellness_preferences.xlsx
+# ---------------------------------------------------------------------------
+
+# This workbook maps Test ID -> real name/DB member_id (see its "ID key"
+# tab) and says so explicitly in its own notes: "This workbook contains
+# real member names. Do not paste names into model prompts. Use the Test
+# ID instead." workbook_members() below only ever reads the Test ID plus
+# numeric/category data - never the name or DB member_id columns - so
+# that guarantee holds no matter what the caller does with the result
+# (store it, put it in an LLM prompt, etc).
+#
+# Its "Last week attendance" tab itself says its session counts are
+# made-up sample data, not real check-ins, so this isn't real attendance
+# history either - what's real here is the GOAL each test member is
+# assigned (from the "Member goals" tab, sourced from an actual
+# member_fitness_goals screenshot for most rows - a few are marked
+# SAMPLE in that tab for members the screenshot didn't cover).
+WORKBOOK_PATH = "docs/member_wellness_preferences.xlsx"
+_PROMPT_INPUT_SHEET = "Prompt input"
+
+# Profile fields pulled from the "Prompt input" sheet, in the exact order
+# the "Prompt template (optimized)" tab's own formula emits them - see
+# _build_optimized_prompt() below, which is a line-for-line port of that
+# formula. Most of these are None/not-yet-available for every current
+# test member (see that sheet's own note: "Yellow cells are not
+# available in the data supplied yet") - a blank one is simply left out
+# of the prompt, costing no tokens, same as the spreadsheet does.
+_PROFILE_FIELDS = [
+    "Gender", "Age", "Fitness goal", "Current activities", "Exercise frequency",
+    "Active", "Conditions", "Medications", "Medical treatment", "Smoker", "Alcohol consumption",
+]
+
+
+def workbook_members(limit: int | None = None) -> list[dict]:
+    """[{"id", "goal", "last_week_sessions", "profile"}, ...], sourced
+    from the workbook's "Prompt input" tab - anonymized to Test ID only
+    (never the name/DB member_id columns on other tabs). "profile" holds
+    the richer per-member fields (age, exercise frequency, smoker, ...)
+    that _build_optimized_prompt() needs for llm-only mode; "goal" and
+    "last_week_sessions" alone are all hybrid mode / the QA checks use.
+    Raises FileNotFoundError if the workbook isn't present (e.g. a
+    deploy that doesn't bundle docs/)."""
+    from openpyxl import load_workbook
+
+    wb = load_workbook(WORKBOOK_PATH, read_only=True, data_only=True)
+    sheet = wb[_PROMPT_INPUT_SHEET]
+    rows = sheet.iter_rows(values_only=True)
+    header = [str(c).strip() if c is not None else "" for c in next(rows)]
+    col = {name: i for i, name in enumerate(header)}
+
+    members = []
+    for row in rows:
+        test_id = row[col["Test ID"]]
+        # The sheet's footer (blank spacer, notes paragraphs) has no
+        # Test ID / isn't one of our m<N> rows - stop at the first row
+        # that isn't real data rather than trying to filter notes text.
+        if not test_id or not isinstance(test_id, str) or not test_id.startswith("m"):
+            continue
+        goal = row[col["Fitness goal"]] or ""
+        last_week = {cat: int(row[col[cat]] or 0) for cat in CATEGORY_CAPS}
+        profile = {field: row[col[field]] for field in _PROFILE_FIELDS}
+        members.append({"id": test_id, "goal": goal, "last_week_sessions": last_week, "profile": profile})
+        if limit is not None and len(members) >= limit:
+            break
+    wb.close()
+    return members
+
+
+_optimized_template_cache: tuple[str, str] | None = None
+
+
+def _load_optimized_prompt_template() -> tuple[str, str]:
+    """(header, footer) fixed text, read live from the "Prompt template
+    (optimized)" tab (cells A2 and A5) rather than hardcoded in code, so
+    editing the wording in the workbook takes effect on the next run
+    with no code change - matches this same file's goal/category rules
+    already living in docs/ rather than being duplicated in Python.
+    Cached for the process lifetime since this text never changes
+    mid-run."""
+    global _optimized_template_cache
+    if _optimized_template_cache is None:
+        from openpyxl import load_workbook
+
+        wb = load_workbook(WORKBOOK_PATH, read_only=True, data_only=True)
+        sheet = wb["Prompt template (optimized)"]
+        header = sheet["A2"].value
+        footer = sheet["A5"].value
+        wb.close()
+        _optimized_template_cache = (header, footer)
+    return _optimized_template_cache
+
+
+def _build_optimized_prompt(member: dict) -> str:
+    """Line-for-line port of the workbook's "Optimized prompt (formula)"
+    column on the "Prompt input" tab - same field order, same "Not
+    provided"/blank fields omitted entirely (so they cost no tokens),
+    same JSON-only output spec with NO rationale. See that sheet for the
+    original Excel formula this mirrors."""
+    header, footer = _load_optimized_prompt_template()
+    profile = member.get("profile") or {}
+
+    def present(field: str) -> bool:
+        value = profile.get(field)
+        return bool(value) and not str(value).startswith("Not")
+
+    lines = ["Member:"]
+    gender, age = profile.get("Gender"), profile.get("Age")
+    if gender or age:
+        lines.append("Profile: " + ", ".join(str(v) for v in (gender, age) if v))
+    if present("Fitness goal"):
+        lines.append(f"Goal: {profile['Fitness goal']}")
+    elif member.get("goal"):
+        lines.append(f"Goal: {member['goal']}")
+    if present("Current activities"):
+        lines.append(f"Activities: {profile['Current activities']}")
+    if present("Exercise frequency"):
+        lines.append(f"Exercise frequency: {profile['Exercise frequency']}")
+    if present("Active"):
+        lines.append(f"Training history: {profile['Active']}")
+    if present("Conditions"):
+        lines.append(f"Conditions: {profile['Conditions']}")
+    if present("Medications"):
+        lines.append(f"Medications: {profile['Medications']}")
+    if present("Medical treatment"):
+        lines.append(f"Medical treatment: {profile['Medical treatment']}")
+    if present("Smoker"):
+        lines.append(f"Smoker: {profile['Smoker']}")
+    if present("Alcohol consumption"):
+        lines.append(f"Alcohol: {profile['Alcohol consumption']}")
+
+    last_week = member["last_week_sessions"]
+    lines.append("Last week: " + ", ".join(f"{cat}={last_week.get(cat, 0)}" for cat in CATEGORY_CAPS))
+
+    return f"{header}\n\n" + "\n".join(lines) + f"\n\n{footer}"
+
+
+# ---------------------------------------------------------------------------
 # QA — did the model's own numbers respect the real constraints?
 # ---------------------------------------------------------------------------
 
@@ -152,8 +296,14 @@ def _qa_check(goal: str, category_targets: dict, rationale: str) -> dict:
     over_cap = any(category_targets.get(cat, 0) > cap for cat, cap in CATEGORY_CAPS.items())
     goal_categories = set(_GOAL_TO_V2_CATEGORIES.get(goal, []))
     missing_category = bool(goal_categories) and not (goal_categories & set(category_targets.keys()))
-    word_count = len(rationale.split())
-    rationale_in_range = 30 <= word_count <= 40
+    # The workbook's prompt format (llm-only mode) asks for numbers only,
+    # no rationale - rationale is "" there, not a failed/too-short one.
+    # An empty rationale means "not applicable," not "out of range," so
+    # it's excluded from rationale_in_range entirely rather than counted
+    # as a miss (which would make every llm-only run show a permanent,
+    # meaningless 0/N on that stat).
+    word_count = len(rationale.split()) if rationale else 0
+    rationale_in_range = (30 <= word_count <= 40) if rationale else None
     return {
         "over_cap": over_cap,
         "missing_category": missing_category,
@@ -180,43 +330,35 @@ def _run_hybrid_member(member: dict) -> dict:
     }
 
 
-def _build_llm_prompt(member: dict) -> str:
-    return (
-        "You are recommending this week's workout session counts for a fitness studio member.\n\n"
-        f"Member's stated goal: {member['goal']}\n"
-        f"Last week's sessions per category: {json.dumps(member['last_week_sessions'])}\n"
-        f"Real weekly slot caps per category (never exceed these): {json.dumps(CATEGORY_CAPS)}\n\n"
-        "Decide this week's target session count for each category yourself, and write a short "
-        "30-40 word rationale explaining the plan to the member.\n\n"
-        "Respond with ONLY this JSON shape, no other text: "
-        '{"category_targets": {"<category>": <int>, ...}, "rationale": "<30-40 word sentence>"}'
-    )
-
-
 def _parse_llm_json(text: str) -> dict:
+    """Workbook's prompt spec asks for ONLY
+    {"Cardio":#,"Strength":#,"Shape":#,"Strength & Conditioning":#,
+    "Wellness":#,"Red Light Therapy":#} - no wrapper object, no
+    rationale. Keys are filtered to CATEGORY_CAPS so a stray/hallucinated
+    key can't sneak into category_targets."""
     match = re.search(r"\{.*\}", text, re.DOTALL)
     if not match:
         raise ValueError("No JSON object found in model response")
     data = json.loads(match.group(0))
-    if "category_targets" not in data or "rationale" not in data:
-        raise ValueError("Model response missing category_targets or rationale")
-    return data
+    if not any(cat in data for cat in CATEGORY_CAPS):
+        raise ValueError("Model response had none of the expected category keys")
+    return {cat: int(data[cat]) for cat in CATEGORY_CAPS if cat in data and data[cat] is not None}
 
 
 def _run_llm_member(member: dict, model: str, dry_run: bool) -> dict:
-    prompt = _build_llm_prompt(member)
+    prompt = _build_optimized_prompt(member)
 
     if dry_run:
         # Stand-in, no real call: reuse the deterministic result as a
         # plausible shape, with rough token estimates (chars / 4 is the
         # usual ballpark for English text) purely so the UI has numbers
-        # to render while testing.
+        # to render while testing. No rationale here either, matching
+        # the real path below - this mode's prompt never asks for one.
         result = recommend_weekly_sessions_v2(member["goal"], member["last_week_sessions"])
-        rationale = rationale_v2(member["goal"], member["last_week_sessions"], result)
-        reply_text = json.dumps({"category_targets": result["category_targets"], "rationale": rationale})
+        reply_text = json.dumps(result["category_targets"])
         return {
             "category_targets": result["category_targets"],
-            "rationale": rationale,
+            "rationale": "",
             "input_tokens": max(1, len(prompt) // 4),
             "output_tokens": max(1, len(reply_text) // 4),
             "thinking_tokens": 0,
@@ -233,10 +375,16 @@ def _run_llm_member(member: dict, model: str, dry_run: bool) -> dict:
 
     from google import genai
 
+    # No system_instruction here on purpose: the workbook's prompt is
+    # self-contained (it has its own "You are a fitness consultant..."
+    # instructions baked in), and this mode exists specifically to
+    # measure that exact prompt's real token cost against the
+    # spreadsheet's estimate - layering the agent's own persona on top
+    # would inflate input tokens beyond what's being benchmarked.
     client = genai.Client()
     response = client.models.generate_content(model=bare_model, contents=prompt)
     reply_text = response.text or ""
-    data = _parse_llm_json(reply_text)
+    category_targets = _parse_llm_json(reply_text)
 
     usage = getattr(response, "usage_metadata", None)
     input_tokens = getattr(usage, "prompt_token_count", None) or 0
@@ -244,8 +392,8 @@ def _run_llm_member(member: dict, model: str, dry_run: bool) -> dict:
     thinking_tokens = getattr(usage, "thoughts_token_count", None) or 0
 
     return {
-        "category_targets": data["category_targets"],
-        "rationale": data["rationale"],
+        "category_targets": category_targets,
+        "rationale": "",
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "thinking_tokens": thinking_tokens,
@@ -362,7 +510,7 @@ def summarize(rows: list[dict]) -> dict:
 # Persistence
 # ---------------------------------------------------------------------------
 
-def save_run(mode: str, model: str, dry_run: bool, summary: dict, rows: list[dict]) -> int:
+def save_run(mode: str, model: str, dry_run: bool, summary: dict, rows: list[dict], source: str = "synthetic") -> int:
     """Persists this run, then deletes every OTHER run — only the most
     recent run is ever kept (its rows cascade-delete with it via
     weekly_goal_run_rows' ON DELETE CASCADE). This is a dashboard
@@ -374,10 +522,10 @@ def save_run(mode: str, model: str, dry_run: bool, summary: dict, rows: list[dic
     with conn.cursor() as cur:
         cur.execute(
             """
-            INSERT INTO weekly_goal_runs (mode, model, dry_run, member_count, summary)
-            VALUES (%s, %s, %s, %s, %s) RETURNING id
+            INSERT INTO weekly_goal_runs (mode, model, dry_run, member_count, summary, source)
+            VALUES (%s, %s, %s, %s, %s, %s) RETURNING id
             """,
-            (mode, model, dry_run, summary["members"], json.dumps(summary)),
+            (mode, model, dry_run, summary["members"], json.dumps(summary), source),
         )
         run_id = cur.fetchone()[0]
         cur.execute("DELETE FROM weekly_goal_runs WHERE id != %s", (run_id,))
@@ -405,7 +553,7 @@ def list_runs() -> list[dict]:
     conn = psycopg.connect(DATABASE_URL)
     with conn.cursor(row_factory=dict_row) as cur:
         cur.execute("""
-            SELECT id, mode, model, dry_run, member_count, summary, created_at
+            SELECT id, mode, model, dry_run, source, member_count, summary, created_at
             FROM weekly_goal_runs ORDER BY id DESC
         """)
         rows = cur.fetchall()
@@ -418,7 +566,7 @@ def get_run(run_id: int) -> dict | None:
     conn = psycopg.connect(DATABASE_URL)
     with conn.cursor(row_factory=dict_row) as cur:
         cur.execute("""
-            SELECT id, mode, model, dry_run, member_count, summary, created_at
+            SELECT id, mode, model, dry_run, source, member_count, summary, created_at
             FROM weekly_goal_runs WHERE id = %s
         """, (run_id,))
         run = cur.fetchone()
