@@ -498,6 +498,57 @@ def run_weekly_goal_batch(agent_slug: str, payload: dict, authorization: str = H
             "member_count": summary["members"], "summary": summary, "rows": rows}
 
 
+@router.get("/agents/{agent_slug}/weekly-goals/options")
+def get_weekly_goal_options(agent_slug: str, authorization: str = Header(None)):
+    """Valid goals and per-category weekly caps, so the dashboard's goal
+    form never hardcodes a list that can drift from the planner's."""
+    from member_goal_setter.weekly_session_planner_v2 import CATEGORY_CAPS, _GOAL_TO_V2_CATEGORIES
+    _require_admin(authorization)
+    if agent_slug != _BATCH_AGENT:
+        raise HTTPException(status_code=404, detail="Weekly goal generator is only available for member-goal-setter")
+    return {"goals": list(_GOAL_TO_V2_CATEGORIES.keys()), "category_caps": CATEGORY_CAPS}
+
+
+@router.post("/agents/{agent_slug}/weekly-goals/generate")
+def generate_weekly_goal(agent_slug: str, payload: dict, authorization: str = Header(None)):
+    """Body: {"goal": "Weight loss", "last_week_sessions": {"Cardio": 1, ...},
+    "profile": {"Age": 34, ...} (optional, llm-only mode only),
+    "mode": "hybrid" | "llm-only", "dry_run": false, "model": "gemini-..."}.
+    Generates one member's weekly goal from the typed-in values - the
+    form-based alternative to test chat. Not persisted: unlike the batch
+    run, this never touches weekly_goal_runs (save_run deletes every
+    other run, which a one-off form submit must not do)."""
+    from common import weekly_goal_batch  # lazy: same reason as the batch endpoint
+    from member_goal_setter.weekly_session_planner_v2 import CATEGORY_CAPS
+    _require_admin(authorization)
+    if agent_slug != _BATCH_AGENT:
+        raise HTTPException(status_code=404, detail="Weekly goal generator is only available for member-goal-setter")
+
+    goal = (payload.get("goal") or "").strip()
+    if not goal:
+        raise HTTPException(status_code=400, detail="goal is required")
+    mode = payload.get("mode", "hybrid")
+    if mode not in ("hybrid", "llm-only"):
+        raise HTTPException(status_code=400, detail="mode must be 'hybrid' or 'llm-only'")
+
+    raw_sessions = payload.get("last_week_sessions") or {}
+    try:
+        last_week = {cat: max(0, int(raw_sessions.get(cat) or 0)) for cat in CATEGORY_CAPS}
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="last_week_sessions values must be whole numbers")
+
+    dry_run = bool(payload.get("dry_run", False))
+    model = (payload.get("model") or MEMBER_GOAL_SETTER_MODEL).strip()
+    if mode == "llm-only" and not (model.startswith("gemini-") or model.startswith("gemini/")):
+        raise HTTPException(status_code=400, detail="model must be a Gemini model (e.g. gemini-3.5-flash-lite)")
+
+    member = {"id": "manual", "goal": goal, "last_week_sessions": last_week, "profile": payload.get("profile") or {}}
+    row = weekly_goal_batch.run_batch([member], mode, model, dry_run=dry_run, log_usage_rows=True)[0]
+    if row.get("error"):
+        raise HTTPException(status_code=502, detail=row["error"])
+    return {"mode": mode, "model": model, "dry_run": dry_run, "result": row}
+
+
 @router.get("/agents/{agent_slug}/weekly-goals/runs")
 def list_weekly_goal_runs(agent_slug: str, authorization: str = Header(None)):
     from common import weekly_goal_batch  # lazy: a missing file must not stop the app starting
