@@ -548,7 +548,12 @@ def generate_weekly_goal(agent_slug: str, payload: dict, authorization: str = He
     if mode == "llm-only" and not (model.startswith("gemini-") or model.startswith("gemini/")):
         raise HTTPException(status_code=400, detail="model must be a Gemini model (e.g. gemini-3.5-flash-lite)")
 
-    member = {"id": "manual", "goal": goal, "last_week_sessions": last_week, "profile": payload.get("profile") or {}}
+    # explain=True makes the model also return its reasoning (see
+    # weekly_goal_batch._EXPLAIN_FOOTER) - batch runs never set this.
+    member = {
+        "id": "manual", "goal": goal, "last_week_sessions": last_week,
+        "profile": payload.get("profile") or {}, "explain": True,
+    }
     row = weekly_goal_batch.run_batch([member], mode, model, dry_run=dry_run, log_usage_rows=True)[0]
     if row.get("error"):
         raise HTTPException(status_code=502, detail=row["error"])

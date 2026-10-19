@@ -183,6 +183,23 @@ _PROFILE_FIELDS = [
 ]
 
 
+# (profile key, prompt label) for answers the workbook doesn't have columns
+# for. Keys match the dashboard goal form's fields.
+_EXTRA_PROFILE_FIELDS = [
+    ("Goal seriousness", "Goal seriousness"),
+    ("Diet", "Diet"),
+    ("Number of meals", "Meals per day"),
+    ("Calories awareness", "Knows daily calorie intake"),
+    ("Supplements", "Supplements"),
+    ("Weak, fatigued or sluggish", "Feels weak/fatigued/sluggish"),
+    ("Digestive discomforts", "Digestive discomforts"),
+    ("Stress level", "Stress"),
+    ("Sleep hours", "Sleep hours per night"),
+    ("Nutrition and exercise", "Would benefit from a structured nutrition & exercise program"),
+    ("Look and feel", "Happy with how they look and feel"),
+]
+
+
 def workbook_members(limit: int | None = None) -> list[dict]:
     """[{"id", "goal", "last_week_sessions", "profile"}, ...], sourced
     from the workbook's "Prompt input" tab - anonymized to Test ID only
@@ -265,6 +282,18 @@ def _load_optimized_prompt_template() -> tuple[str, str]:
     return _optimized_template_cache
 
 
+# Replaces the workbook's JSON-only footer when a caller (the dashboard's
+# goal form) wants to see why. Kept out of the workbook on purpose: batch
+# runs benchmark that exact numbers-only prompt's token cost.
+_EXPLAIN_FOOTER = (
+    'Answer with JSON only, no other text: {"Cardio":#,"Strength":#,"Shape":#,'
+    '"Strength & Conditioning":#,"Wellness":#,"Red Light Therapy":#,"Reasoning":"..."}\n'
+    "Reasoning: 2-4 short sentences in plain words explaining the numbers - say which of the member's "
+    "details (goal, last week's sessions, exercise frequency, health, lifestyle) influenced them and how. "
+    "Only mention details that were actually provided."
+)
+
+
 def _build_optimized_prompt(member: dict) -> str:
     """Line-for-line port of the workbook's "Optimized prompt (formula)"
     column on the "Prompt input" tab - same field order, same "Not
@@ -303,9 +332,20 @@ def _build_optimized_prompt(member: dict) -> str:
     if present("Alcohol consumption"):
         lines.append(f"Alcohol: {profile['Alcohol consumption']}")
 
+    # Questionnaire answers beyond the workbook's columns (the app's "info"
+    # section etc.), only ever present for dashboard form submits - batch
+    # members don't carry them, so batch prompts/token costs are unchanged.
+    # Only blanks are skipped here, not "Not ..." values like the workbook
+    # fields above - "Not Really" is a real answer to goal seriousness.
+    for field, label in _EXTRA_PROFILE_FIELDS:
+        if profile.get(field):
+            lines.append(f"{label}: {profile[field]}")
+
     last_week = member["last_week_sessions"]
     lines.append("Last week: " + ", ".join(f"{cat}={last_week.get(cat, 0)}" for cat in CATEGORY_CAPS))
 
+    if member.get("explain"):
+        footer = _EXPLAIN_FOOTER
     return f"{header}\n\n" + "\n".join(lines) + f"\n\n{footer}"
 
 
@@ -366,6 +406,17 @@ def _parse_llm_json(text: str) -> dict:
     return {cat: int(data[cat]) for cat in CATEGORY_CAPS if cat in data and data[cat] is not None}
 
 
+def _parse_llm_reasoning(text: str) -> str:
+    """The "Reasoning" string from an explain-mode reply, or "" if it's
+    missing/unparseable - the numbers are already parsed by
+    _parse_llm_json, so a missing explanation must never fail the run."""
+    try:
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        return str(json.loads(match.group(0)).get("Reasoning", "")).strip() if match else ""
+    except (ValueError, AttributeError):
+        return ""
+
+
 def _run_llm_member(member: dict, model: str, dry_run: bool) -> dict:
     prompt = _build_optimized_prompt(member)
 
@@ -379,7 +430,7 @@ def _run_llm_member(member: dict, model: str, dry_run: bool) -> dict:
         reply_text = json.dumps(result["category_targets"])
         return {
             "category_targets": result["category_targets"],
-            "rationale": "",
+            "rationale": "(Dry run - no model call, so no reasoning.)" if member.get("explain") else "",
             "input_tokens": max(1, len(prompt) // 4),
             "output_tokens": max(1, len(reply_text) // 4),
             "thinking_tokens": 0,
@@ -414,7 +465,7 @@ def _run_llm_member(member: dict, model: str, dry_run: bool) -> dict:
 
     return {
         "category_targets": category_targets,
-        "rationale": "",
+        "rationale": _parse_llm_reasoning(reply_text) if member.get("explain") else "",
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "thinking_tokens": thinking_tokens,
