@@ -218,6 +218,29 @@ def workbook_members(limit: int | None = None) -> list[dict]:
     return members
 
 
+def profile_field_options() -> dict[str, list[str]]:
+    """{profile field: distinct non-blank values found in the workbook},
+    for the dashboard's goal form to offer as pick-lists instead of making
+    someone retype them. Fields the workbook has no data for yet (its
+    yellow "not available" columns) come back as an empty list. Same
+    anonymity guarantee as workbook_members(): only profile columns are
+    read, never names or DB member_ids. Returns {} if the workbook isn't
+    on this server."""
+    try:
+        members = workbook_members()
+    except FileNotFoundError:
+        return {}
+    options: dict[str, list[str]] = {}
+    for field in _PROFILE_FIELDS:
+        values = {
+            str(m["profile"][field]).strip()
+            for m in members
+            if m["profile"].get(field) not in (None, "") and not str(m["profile"][field]).startswith("Not")
+        }
+        options[field] = sorted(values, key=lambda v: (not v.isdigit(), int(v) if v.isdigit() else 0, v))
+    return options
+
+
 _optimized_template_cache: tuple[str, str] | None = None
 
 

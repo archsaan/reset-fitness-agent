@@ -502,11 +502,17 @@ def run_weekly_goal_batch(agent_slug: str, payload: dict, authorization: str = H
 def get_weekly_goal_options(agent_slug: str, authorization: str = Header(None)):
     """Valid goals and per-category weekly caps, so the dashboard's goal
     form never hardcodes a list that can drift from the planner's."""
+    from common import weekly_goal_batch  # lazy: a missing file must not stop the app starting
     from member_goal_setter.weekly_session_planner_v2 import CATEGORY_CAPS, _GOAL_TO_V2_CATEGORIES
     _require_admin(authorization)
     if agent_slug != _BATCH_AGENT:
         raise HTTPException(status_code=404, detail="Weekly goal generator is only available for member-goal-setter")
-    return {"goals": list(_GOAL_TO_V2_CATEGORIES.keys()), "category_caps": CATEGORY_CAPS}
+    return {
+        "goals": list(_GOAL_TO_V2_CATEGORIES.keys()),
+        "category_caps": CATEGORY_CAPS,
+        # Values seen in the test-member workbook, offered as pick-lists.
+        "profile_options": weekly_goal_batch.profile_field_options(),
+    }
 
 
 @router.post("/agents/{agent_slug}/weekly-goals/generate")
