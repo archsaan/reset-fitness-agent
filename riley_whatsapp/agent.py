@@ -24,6 +24,7 @@ from google.adk.agents import Agent
 from google.adk.agents.readonly_context import ReadonlyContext
 from google.adk.utils.instructions_utils import inject_session_state
 
+from common.agent_config import get_system_prompt
 from common.booking_gate import make_log_usage
 from common.config import RILEY_WHATSAPP_MODEL, resolve_model
 from common.rolling_summary import make_refresh_conversation_context
@@ -103,8 +104,11 @@ RILEY_WHATSAPP_RULES = (
 
 
 async def build_instruction(readonly_context: ReadonlyContext) -> str:
+    # Live-editable from the dashboard's Config panel, like tribe_app/pfc;
+    # RULES below stay hardcoded so an edit can't remove the guardrails.
+    persona = get_system_prompt(AGENT_SLUG, default=RILEY_WHATSAPP_SYSTEM_PROMPT)
     template = (
-        RILEY_WHATSAPP_SYSTEM_PROMPT
+        persona
         + "\n\n--- CONVERSATION SO FAR ---\n{conversation_context}"
         + "\n\n--- RULES ---\n" + RILEY_WHATSAPP_RULES
     )

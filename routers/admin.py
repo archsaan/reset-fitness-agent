@@ -71,6 +71,7 @@ from common.config import (
     MOCK_ADMIN_TOKEN,
     PFC_MODEL,
     PFC_SYSTEM_PROMPT,
+    RILEY_WHATSAPP_MODEL,
     TRIBE_APP_MODEL,
     TRIBE_APP_SYSTEM_PROMPT,
 )
@@ -83,6 +84,7 @@ from common.kb import (
     toggle_kb_doc,
 )
 from common.session_stats import get_session_length_stats
+from riley_whatsapp.agent import RILEY_WHATSAPP_SYSTEM_PROMPT
 
 logger = logging.getLogger("reset_fitness_adk.admin")
 
@@ -139,6 +141,13 @@ _AGENTS = [
     # above, using AI_COACH_MODEL/AI_COACH_SYSTEM_PROMPT from
     # common/config.py, which already exist) once that folder is built.
     {
+        "id": "riley-whatsapp",
+        "slug": "riley-whatsapp",
+        "name": "Riley WhatsApp",
+        "description": "Answers Reset Fitness leads on WhatsApp via Twilio and hands them to the team. No booking.",
+        "active_model": RILEY_WHATSAPP_MODEL,
+    },
+    {
         "id": "member-goal-setter",
         "slug": "member-goal-setter",
         "name": "Member Goal Setter",
@@ -153,6 +162,7 @@ _AGENTS = [
 _DEFAULT_PROMPTS = {
     "tribe-app": TRIBE_APP_SYSTEM_PROMPT,
     "pfc": PFC_SYSTEM_PROMPT,
+    "riley-whatsapp": RILEY_WHATSAPP_SYSTEM_PROMPT,
     "member-goal-setter": MEMBER_GOAL_SETTER_SYSTEM_PROMPT,
 }
 
@@ -170,6 +180,9 @@ def _root_agent_for(agent_slug: str):
         return root_agent
     if agent_slug == "pfc":
         from pfc.agent import root_agent
+        return root_agent
+    if agent_slug == "riley-whatsapp":
+        from riley_whatsapp.agent import root_agent
         return root_agent
     if agent_slug == "ai-coach":
         from ai_coach.agent import root_agent
