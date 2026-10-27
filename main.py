@@ -37,6 +37,7 @@ from common.excluding_agent_loader import ExcludingAgentLoader
 from common.kb import init_kb_store
 from routers.admin import router as admin_router
 from routers.live import router as live_router
+from routers.whatsapp import router as whatsapp_router
 
 # Agents kept OUT of get_fast_api_app()'s shared, Postgres-backed
 # session service - each one needs its own router.py giving it a
@@ -70,6 +71,7 @@ app: FastAPI = get_fast_api_app(
 
 app.include_router(admin_router)
 app.include_router(live_router)
+app.include_router(whatsapp_router)
 
 
 @app.get("/")

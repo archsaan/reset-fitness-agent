@@ -170,6 +170,21 @@ TRIBE_APP_MODEL = os.environ.get("TRIBE_APP_MODEL", "gemini-3.5-flash-lite")
 PFC_MODEL = os.environ.get("PFC_MODEL", "gemini-3.5-flash-lite")
 AI_COACH_MODEL = os.environ.get("AI_COACH_MODEL", "gemini-3.5-flash-lite")
 MEMBER_GOAL_SETTER_MODEL = os.environ.get("MEMBER_GOAL_SETTER_MODEL", "gemini-3.5-flash-lite")
+RILEY_WHATSAPP_MODEL = os.environ.get("RILEY_WHATSAPP_MODEL", "gemini-3.5-flash-lite")
+
+# ---------------------------------------------------------
+# Twilio WhatsApp (routers/whatsapp.py)
+# ---------------------------------------------------------
+# TWILIO_AUTH_TOKEN signs every webhook Twilio sends; the route rejects
+# anything whose X-Twilio-Signature doesn't verify, since the endpoint is
+# public and each accepted message costs a model call. PUBLIC_BASE_URL is
+# the https URL Twilio is configured to call (no trailing slash) - needed
+# because behind Render's proxy the app sees http://, but Twilio signs the
+# URL it actually requested. TWILIO_VALIDATE_SIGNATURE=false is for local
+# curl testing only.
+TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "")
+TWILIO_VALIDATE_SIGNATURE = os.environ.get("TWILIO_VALIDATE_SIGNATURE", "true").lower() != "false"
+PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
 
 
 def resolve_model(model_name: str):

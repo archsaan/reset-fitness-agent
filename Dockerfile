@@ -13,6 +13,7 @@ COPY routers ./routers
 COPY tribe_app ./tribe_app
 COPY pfc ./pfc
 COPY member_goal_setter ./member_goal_setter
+COPY riley_whatsapp ./riley_whatsapp
 COPY docs ./docs
 COPY main.py .
 
